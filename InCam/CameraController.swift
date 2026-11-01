@@ -39,10 +39,16 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var rawPhotoSupported = false
     @Published private(set) var videoHDRSupported = false
     @Published private(set) var videoHDREnabled = false
+    @Published private(set) var videoStabilization: VideoStabilization = .auto
+    @Published private(set) var availableVideoStabilizations: [VideoStabilization] = [.off]
     /// This is an InCam recipe-workflow mode, not an assertion that the device
     /// is recording Apple Log. It keeps incompatible global color controls off.
     @Published private(set) var logModeEnabled = false
     @Published private(set) var photoFormat = "HEIF"
+    @Published private(set) var photoSpeedMode: PhotoSpeedMode = .standard
+    @Published private(set) var responsivePhotoCaptureSupported = false
+    @Published private(set) var zeroShutterLagSupported = false
+    @Published private(set) var fastPhotoCaptureSupported = false
     @Published private(set) var lenses: [CameraLensOption] = []
     @Published private(set) var selectedLensID = ""
     @Published private(set) var isFrontCamera = false
@@ -66,6 +72,8 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var focusPosition: Float = 0.5
     @Published var levelRoll: Double = 0
     @Published var levelPitch: Double = 0
+    @Published private(set) var levelIsCentered = false
+    @Published private(set) var health: CameraHealth = .ready
     @Published var lastError: String?
     @Published private(set) var audioInputs: [AudioInputOption] = []
     @Published private(set) var audioInputID = ""
@@ -94,11 +102,22 @@ final class CameraController: NSObject, ObservableObject {
     private let recipeLock = NSLock()
     private var cameraColorRecipe = CameraColorRecipe(name: "Custom Color")
     private var recordedRecipe = CameraColorRecipe(name: "Custom Color")
+    /// Nil means guides are preview-only. A finite aspect is captured at the
+    /// start of a shot so changing the UI guide cannot alter a clip in flight.
+    private var outputFramingAspect: CGFloat?
+    private var recordedOutputFramingAspect: CGFloat?
     private var selectivePreviewEnabled = false // Capture queue only.
     private var input: AVCaptureDeviceInput?
     private var timer: Timer?
     private var recordStartedAt: Date?
     private let motion = CMMotionManager()
+    private let levelMotionQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "app.incam.level-motion"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInteractive
+        return queue
+    }()
     private var levelMonitoringEnabled = false
     /// Core Motion reports attitude in the device's native portrait axes. The
     /// on-screen level must remap those axes to the active camera interface
@@ -117,6 +136,24 @@ final class CameraController: NSObject, ObservableObject {
     private var whiteBalanceObservation: NSKeyValueObservation?
     private var zoomTimer: Timer?
     private var zoomVelocity: Double = 0
+    private var pressureObservation: NSKeyValueObservation?
+    private var sessionNotificationTokens: [NSObjectProtocol] = []
+    private var shouldRun = false // Capture queue only.
+    /// Optional capture features start after the basic viewfinder. This keeps
+    /// the first SwiftUI interaction responsive instead of waiting on audio
+    /// routing, photo tuning, capability discovery, and Metal setup.
+    private var deferredSetupCompleted = false // Capture queue only.
+    /// Advances whenever the viewfinder is stopped. Delayed startup work must
+    /// check this before touching AVFoundation so a dismissed screen cannot
+    /// revive audio, metering, or a session in the background.
+    private var startupGeneration = 0 // Capture queue only.
+    private var pressureThrottledPreview = false // Capture queue only.
+    /// Prism-style gravity roll is filtered before publishing. Attitude Euler
+    /// angles were the source of the previous level's unstable, backward
+    /// movement near vertical device positions.
+    private var filteredLevelRollRadians = 0.0
+    private var levelCenteredOnMotionQueue = false
+    private var lastLevelUIPublish = Date.distantPast
 
     override init() {
         super.init()
@@ -129,9 +166,11 @@ final class CameraController: NSObject, ObservableObject {
         let savedFrameRate = UserDefaults.standard.integer(forKey: "incam.capture.frame-rate.v1")
         frameRate = savedFrameRate > 0 ? savedFrameRate : 24
         videoCodec = VideoCodec(rawValue: UserDefaults.standard.string(forKey: "incam.capture.codec.v1") ?? "") ?? .hevc
+        videoStabilization = VideoStabilization(rawValue: UserDefaults.standard.string(forKey: "incam.capture.stabilization.v1") ?? "") ?? .auto
+        photoSpeedMode = PhotoSpeedMode(rawValue: UserDefaults.standard.string(forKey: "incam.photo.speed.v1") ?? "") ?? .standard
         shutterAngleMode = UserDefaults.standard.bool(forKey: "incam.shutter.angle-mode.v1")
         audioChannelMode = AudioChannelMode(rawValue: UserDefaults.standard.string(forKey: "incam.audio.channel-mode.v1") ?? "") ?? .stereo
-        audioOutputMode = AudioOutputMode(rawValue: UserDefaults.standard.string(forKey: "incam.audio.output-mode.v1") ?? "") ?? .system
+        audioOutputMode = AudioOutputMode(rawValue: UserDefaults.standard.string(forKey: "incam.auddio.output-mode.v1") ?? "") ?? .system
         recordingFolderName = Self.cleanedFolderName(UserDefaults.standard.string(forKey: "incam.media.folder.v1") ?? "ENES")
         recordingPrefix = Self.cleanedPrefix(UserDefaults.standard.string(forKey: "incam.media.prefix.v1") ?? "INCAM")
         recordingNamingMode = RecordingNamingMode(rawValue: UserDefaults.standard.string(forKey: "incam.media.naming.v1") ?? "") ?? .sequence
@@ -144,9 +183,20 @@ final class CameraController: NSObject, ObservableObject {
             // starting shutter. Explicit later manual choices still persist.
             UserDefaults.standard.set(CameraExposureDefaults.defaultShutterSeconds, forKey: "incam.manual.shutter.seconds.v1")
         }
+        installSessionObservers()
+    }
+
+    deinit {
+        pressureObservation?.invalidate()
+        sessionNotificationTokens.forEach(NotificationCenter.default.removeObserver)
     }
 
     func start() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.health = self.isConfigured ? .ready : .starting
+        }
+        queue.async { [weak self] in self?.shouldRun = true }
         if levelMonitoringEnabled { startMotion() }
         #if targetEnvironment(simulator)
         // The simulator has no rear camera; keep the control workflow testable.
@@ -171,7 +221,10 @@ final class CameraController: NSObject, ObservableObject {
                 if granted { self?.configureIfNeeded() }
             }
         default:
-            authorization = AVCaptureDevice.authorizationStatus(for: .video)
+            DispatchQueue.main.async {
+                self.authorization = AVCaptureDevice.authorizationStatus(for: .video)
+                self.health = .unavailable("Camera access is required to start the viewfinder.")
+            }
         }
         #endif
     }
@@ -187,9 +240,11 @@ final class CameraController: NSObject, ObservableObject {
         motion.stopDeviceMotionUpdates()
         stopTimer()
         queue.async { [weak self] in
-            self?.audioMeterTimer?.cancel()
-            self?.audioMeterTimer = nil
             guard let self else { return }
+            self.shouldRun = false
+            self.startupGeneration &+= 1
+            self.audioMeterTimer?.cancel()
+            self.audioMeterTimer = nil
             // A camera session is the app's largest background cost. Finish an
             // active movie, then stop every capture stream when the scene is
             // hidden or backgrounded.
@@ -202,6 +257,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.audioLevels = []
                 self.audioStatus = "Microphone inactive"
                 self.selectiveColorPreviewActive = false
+                self.health = .starting
             }
         }
     }
@@ -232,7 +288,7 @@ final class CameraController: NSObject, ObservableObject {
             self.captureRotation = angle
             // The native preview layer rotates itself, while the Color Mix
             // video-data connection needs the same update explicitly.
-            self.rotate(self.selectivePreviewOutput.connection(with: .video))
+            self.rotate(self.selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
         }
     }
 
@@ -249,12 +305,16 @@ final class CameraController: NSObject, ObservableObject {
         recipeLock.lock()
         cameraColorRecipe = previewRecipe
         recipeLock.unlock()
-        // AVCaptureVideoPreviewLayer does not expose its pixels for any
-        // recipe render. Add the direct-texture output only while a visible
-        // recipe is active; neutral shooting remains on the native preview.
-        let needsSelectivePreview = previewRecipe.hasVisibleAdjustments
+        // Saving or loading a recipe must remain cheap. GPU presentation is
+        // enabled explicitly when the Camera Colors tool is opened.
+    }
+
+    /// Camera Colors is an explicit opt-in for the direct-texture stream. A
+    /// saved recipe alone must never make ordinary camera launch heavier.
+    func setCameraColorsPreviewEnabled(_ enabled: Bool) {
         queue.async { [weak self] in
-            self?.setSelectivePreviewEnabled(needsSelectivePreview)
+            guard let self else { return }
+            self.setSelectivePreviewEnabled(enabled && self.currentRecipe().hasVisibleAdjustments)
         }
     }
 
@@ -280,7 +340,7 @@ final class CameraController: NSObject, ObservableObject {
             ]
             selectivePreviewOutput.setSampleBufferDelegate(self, queue: selectivePreviewQueue)
             session.addOutput(selectivePreviewOutput)
-            rotate(selectivePreviewOutput.connection(with: .video))
+            rotate(selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
             setSelectivePreviewPresentation(true)
         } else {
             if session.outputs.contains(selectivePreviewOutput) {
@@ -297,8 +357,10 @@ final class CameraController: NSObject, ObservableObject {
         selectivePreviewSinkLock.lock()
         selectivePreviewSink = sink
         let active = selectivePreviewEnabled
+        let frameRate = pressureThrottledPreview ? 15 : 30
         selectivePreviewSinkLock.unlock()
         sink?.setSelectiveColorPreviewActive(active)
+        sink?.setSelectiveColorPreviewFrameRate(frameRate)
     }
 
     private func setSelectivePreviewPresentation(_ active: Bool) {
@@ -307,6 +369,13 @@ final class CameraController: NSObject, ObservableObject {
         selectivePreviewSinkLock.unlock()
         sink?.setSelectiveColorPreviewActive(active)
         DispatchQueue.main.async { self.selectiveColorPreviewActive = active }
+    }
+
+    private func setSelectivePreviewFrameRate(_ framesPerSecond: Int) {
+        selectivePreviewSinkLock.lock()
+        let sink = selectivePreviewSink
+        selectivePreviewSinkLock.unlock()
+        sink?.setSelectiveColorPreviewFrameRate(framesPerSecond)
     }
 
     func setPhotoFormat(_ format: String) {
@@ -398,6 +467,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.session.addInput(replacement)
                 self.input = replacement
                 self.session.commitConfiguration()
+                self.rotate(self.selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
                 self.observeZoom(device)
                 self.observeAutoReadouts(device)
                 self.readCapabilities(device)
@@ -429,6 +499,16 @@ final class CameraController: NSObject, ObservableObject {
         let next = current + (towardTelephoto ? 1 : -1)
         guard ordered.indices.contains(next) else { return }
         selectLens(ordered[next].id)
+    }
+
+    /// Controls whether the selected composition guide is also applied to
+    /// saved stills and the post-recording movie export. It is intentionally
+    /// opt-in: guides alone remain non-destructive composition tools.
+    func setOutputFraming(aspect: CGFloat?) {
+        let validAspect = aspect.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        recipeLock.lock()
+        outputFramingAspect = validAspect
+        recipeLock.unlock()
     }
 
     /// Swaps between the front wide camera and the current rear camera only
@@ -476,6 +556,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.session.addInput(replacement)
                 self.input = replacement
                 self.session.commitConfiguration()
+                self.rotate(self.selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
                 self.observeZoom(device)
                 self.observeAutoReadouts(device)
                 self.readCapabilities(device)
@@ -581,7 +662,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func setFrameRate(_ requested: Int) {
-        guard !isRecording, capabilities.frameRates.contains(requested) else { return }
+        guard !isRecording else { return }
         frameRate = requested
         UserDefaults.standard.set(requested, forKey: "incam.capture.frame-rate.v1")
         // A frame-rate change deliberately establishes its matching 180°-style
@@ -596,16 +677,20 @@ final class CameraController: NSObject, ObservableObject {
         UserDefaults.standard.set(exposureSeconds, forKey: "incam.manual.shutter.seconds.v1")
         queue.async { [weak self] in
             guard let self, let device = self.input?.device else { return }
-            let supported = device.activeFormat.videoSupportedFrameRateRanges.contains {
-                Double(requested) >= $0.minFrameRate && Double(requested) <= $0.maxFrameRate
+            guard let format = Self.preferredFormat(for: device,
+                                                     resolution: self.videoResolution,
+                                                     frameRate: requested) else {
+                self.publish(message: "\(self.videoResolution.rawValue) \(requested) fps is not available on this lens.")
+                return
             }
-            guard supported else { return }
             do {
                 try device.lockForConfiguration()
+                device.activeFormat = format
                 let duration = CMTime(value: 1, timescale: CMTimeScale(requested))
                 device.activeVideoMinFrameDuration = duration
                 device.activeVideoMaxFrameDuration = duration
                 device.unlockForConfiguration()
+                self.readCapabilities(device)
                 self.applyExposure()
             } catch { self.publish(error) }
         }
@@ -629,7 +714,7 @@ final class CameraController: NSObject, ObservableObject {
             self.session.beginConfiguration()
             self.session.sessionPreset = preset
             self.session.commitConfiguration()
-            if let device = self.input?.device { self.readCapabilities(device) }
+            if let device = self.input?.device { self.readCapabilities(device, resolution: requested) }
             DispatchQueue.main.async {
                 self.videoResolution = requested
                 UserDefaults.standard.set(requested.rawValue, forKey: "incam.capture.resolution")
@@ -668,6 +753,40 @@ final class CameraController: NSObject, ObservableObject {
                 device.unlockForConfiguration()
                 DispatchQueue.main.async { self.videoHDREnabled = active }
             } catch { self.publish(error) }
+        }
+    }
+
+    /// Sets only a mode that the current MovieFileOutput connection confirms
+    /// it can use. A lens or format change can remove a mode at any time.
+    func setVideoStabilization(_ requested: VideoStabilization) {
+        guard !isRecording, availableVideoStabilizations.contains(requested) else { return }
+        queue.async { [weak self] in
+            guard let self,
+                  let connection = self.movieOutput.connection(with: .video),
+                  let device = self.input?.device else { return }
+            let native = Self.nativeStabilization(for: requested)
+            guard requested == .off || (connection.isVideoStabilizationSupported && device.activeFormat.isVideoStabilizationModeSupported(native)) else { return }
+            connection.preferredVideoStabilizationMode = native
+            DispatchQueue.main.async {
+                // `activeVideoStabilizationMode` can briefly report Off while
+                // a connection is starting. Keep the person's supported
+                // preference rather than silently losing it during launch.
+                self.videoStabilization = requested
+                UserDefaults.standard.set(requested.rawValue, forKey: "incam.capture.stabilization.v1")
+            }
+        }
+    }
+
+    /// Responsive still capture is opt-in because it reserves extra photo
+    /// buffers. Deferred Photo delivery intentionally remains off: its final
+    /// image is completed through Photos, not InCam's private gallery.
+    func setPhotoSpeedMode(_ requested: PhotoSpeedMode) {
+        guard !isRecording else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.session.beginConfiguration()
+            self.configurePhotoSpeedCapture(requested)
+            self.session.commitConfiguration()
         }
     }
 
@@ -965,9 +1084,13 @@ final class CameraController: NSObject, ObservableObject {
         queue.async { [weak self] in
             guard let self, !self.sessionConfigured else {
                 guard let self else { return }
-                self.activateAudioSession()
                 if self.session.isRunning == false { self.session.startRunning() }
-                self.startAudioMetering()
+                if self.deferredSetupCompleted {
+                    self.activateAudioSession()
+                    self.startAudioMetering()
+                } else {
+                    self.scheduleDeferredCaptureSetup()
+                }
                 self.setSelectivePreviewPresentation(self.selectivePreviewEnabled)
                 return
             }
@@ -976,11 +1099,14 @@ final class CameraController: NSObject, ObservableObject {
             self.session.sessionPreset = self.session.canSetSessionPreset(preferredPreset) ? preferredPreset : .high
 
             let devices = Self.physicalCameras()
-            guard let device = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? devices.first else {
-                self.session.commitConfiguration()
-                self.publish(message: "No rear camera is available.")
-                return
-            }
+                guard let device = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? devices.first else {
+                    self.session.commitConfiguration()
+                    self.publish(message: "No rear camera is available.")
+                    DispatchQueue.main.async {
+                        self.health = .unavailable("No compatible rear camera is available.")
+                    }
+                    return
+                }
             do {
                 let input = try AVCaptureDeviceInput(device: device)
                 guard self.session.canAddInput(input) else { throw CameraFailure.configuration }
@@ -995,25 +1121,55 @@ final class CameraController: NSObject, ObservableObject {
 
                 if self.session.canAddOutput(self.photoOutput) { self.session.addOutput(self.photoOutput) }
                 if self.session.canAddOutput(self.movieOutput) { self.session.addOutput(self.movieOutput) }
-                self.photoOutput.maxPhotoQualityPrioritization = .quality
-                self.configureAudio()
-                self.readCapabilities(device)
                 self.session.commitConfiguration()
                 self.sessionConfigured = true
-                DispatchQueue.main.async { self.isConfigured = true }
+                self.observeDeviceHealth(device)
+                DispatchQueue.main.async {
+                    self.isConfigured = true
+                    self.health = .ready
+                }
                 self.session.startRunning()
-                // A new session begins in the requested 4K/24 profile when
-                // the active lens supports it; later user choices are still
-                // applied by the frame-rate control itself.
-                self.setFrameRate(self.frameRate)
-                self.startAudioMetering()
-                // A recipe can be restored before the capture session has
-                // finished configuring. Attach its optional HSL stream only
-                // now that AVCapture can safely accept another output.
-                self.setSelectivePreviewEnabled(self.currentRecipe().hasVisibleAdjustments)
+                self.scheduleDeferredCaptureSetup()
             } catch {
                 self.session.commitConfiguration()
                 self.publish(error)
+                DispatchQueue.main.async {
+                    self.health = .unavailable("Camera could not start. Try closing another app that is using it.")
+                }
+            }
+        }
+    }
+
+    /// The first camera frame and its essential controls win startup. Audio
+    /// routing, format inspection, stabilization discovery and photo tuning
+    /// are deliberately delayed until the viewfinder has had time to become
+    /// interactive. This follows the staged-start pattern used by the faster
+    /// open-source camera apps, without lowering recording quality.
+    private func scheduleDeferredCaptureSetup() {
+        let generation = startupGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            self?.queue.async { [weak self] in
+                guard let self,
+                      self.shouldRun,
+                      self.sessionConfigured,
+                      !self.deferredSetupCompleted,
+                      self.startupGeneration == generation,
+                      let device = self.input?.device else { return }
+
+                self.session.beginConfiguration()
+                self.photoOutput.maxPhotoQualityPrioritization = .quality
+                self.configurePhotoSpeedCapture(self.photoSpeedMode)
+                self.configureAudio()
+                self.readCapabilities(device)
+                self.applyVideoStabilization()
+                self.session.commitConfiguration()
+                self.deferredSetupCompleted = true
+
+                // Apply the saved 4K/24 (or user-chosen) profile after the
+                // primary preview is already usable, not before its first UI
+                // frame can accept a tap.
+                self.setFrameRate(self.frameRate)
+                self.startAudioMetering()
             }
         }
     }
@@ -1047,6 +1203,137 @@ final class CameraController: NSObject, ObservableObject {
               let audioInput = try? AVCaptureDeviceInput(device: microphone),
               session.canAddInput(audioInput) else { return }
         session.addInput(audioInput)
+    }
+
+    /// Enables Apple's responsive still pipeline only on formats that confirm
+    /// support. It uses Zero Shutter Lag plus responsive/fast prioritization;
+    /// automatic deferred delivery is intentionally not enabled because its
+    /// full-resolution result is delivered through Photos, not this app's
+    /// private gallery.
+    private func configurePhotoSpeedCapture(_ requested: PhotoSpeedMode) {
+        let zeroShutterLagSupported = photoOutput.isZeroShutterLagSupported
+        let wantsResponsive = requested == .responsive && zeroShutterLagSupported
+
+        photoOutput.isZeroShutterLagEnabled = wantsResponsive
+        let responsiveSupported = photoOutput.isResponsiveCaptureSupported
+        let responsiveEnabled = wantsResponsive && responsiveSupported
+        photoOutput.isResponsiveCaptureEnabled = responsiveEnabled
+
+        let fastSupported = photoOutput.isFastCapturePrioritizationSupported
+        photoOutput.isFastCapturePrioritizationEnabled = responsiveEnabled && fastSupported
+        let effective: PhotoSpeedMode = responsiveEnabled ? .responsive : .standard
+
+        DispatchQueue.main.async {
+            self.zeroShutterLagSupported = zeroShutterLagSupported
+            self.responsivePhotoCaptureSupported = zeroShutterLagSupported && responsiveSupported
+            self.fastPhotoCaptureSupported = fastSupported
+            self.photoSpeedMode = effective
+            UserDefaults.standard.set(effective.rawValue, forKey: "incam.photo.speed.v1")
+        }
+    }
+
+    /// Applies the saved, capability-checked preference whenever the active
+    /// camera connection is rebuilt for a different lens or format.
+    private func applyVideoStabilization() {
+        guard let connection = movieOutput.connection(with: .video), let device = input?.device else { return }
+        let requested = videoStabilization
+        let native = Self.nativeStabilization(for: requested)
+        let supported = requested == .off || (connection.isVideoStabilizationSupported && device.activeFormat.isVideoStabilizationModeSupported(native))
+        let autoSupported = connection.isVideoStabilizationSupported && device.activeFormat.isVideoStabilizationModeSupported(.auto)
+        let effective: VideoStabilization = supported ? requested : (autoSupported ? .auto : .off)
+        connection.preferredVideoStabilizationMode = Self.nativeStabilization(for: effective)
+        DispatchQueue.main.async {
+            self.videoStabilization = effective
+            UserDefaults.standard.set(effective.rawValue, forKey: "incam.capture.stabilization.v1")
+        }
+    }
+
+    /// Session interruptions are expected when another camera client wins or
+    /// iOS needs to reset media services. The visible message explains that
+    /// state and the session resumes only while this screen is still active.
+    private func installSessionObservers() {
+        let center = NotificationCenter.default
+        sessionNotificationTokens = [
+            center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main) { [weak self] notification in
+                self?.handleSessionInterrupted(notification)
+            },
+            center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { [weak self] _ in
+                self?.resumeSessionIfNeeded(reason: "Camera connection restored.")
+            },
+            center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] notification in
+                self?.handleSessionRuntimeError(notification)
+            }
+        ]
+    }
+
+    private func handleSessionInterrupted(_ notification: Notification) {
+        let reason = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber
+        let suffix = reason.map { " (reason \($0.intValue))" } ?? ""
+        DispatchQueue.main.async {
+            self.health = .recovering("Camera paused by iPhone\(suffix). Waiting to resume.")
+        }
+        setSelectivePreviewPresentation(false)
+    }
+
+    private func handleSessionRuntimeError(_ notification: Notification) {
+        let error = notification.userInfo?[AVCaptureSessionErrorKey] as? AVError
+        let reset = error?.code == .mediaServicesWereReset
+        DispatchQueue.main.async {
+            self.health = .recovering(reset ? "Camera service reset. Restoring the session…" : "Camera interrupted. Restoring the session…")
+        }
+        resumeSessionIfNeeded(reason: reset ? "Camera service restored." : "Camera recovered.")
+    }
+
+    private func resumeSessionIfNeeded(reason: String) {
+        queue.async { [weak self] in
+            guard let self, self.shouldRun, self.sessionConfigured else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+            self.setSelectivePreviewPresentation(self.selectivePreviewEnabled)
+            DispatchQueue.main.async { self.health = .ready }
+        }
+    }
+
+    private func observeDeviceHealth(_ device: AVCaptureDevice) {
+        pressureObservation?.invalidate()
+        pressureObservation = device.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] device, _ in
+            self?.handleSystemPressure(device.systemPressureState.level)
+        }
+    }
+
+    private func handleSystemPressure(_ level: AVCaptureDevice.SystemPressureState.Level) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let throttled: Bool
+            let message: String?
+            if level == .serious {
+                throttled = true
+                message = "Camera is warm — Camera Colors preview is reduced until it cools."
+            } else if level == .critical {
+                throttled = true
+                message = "Camera is very warm — Camera Colors preview is reduced until it cools."
+            } else if level == .shutdown {
+                throttled = true
+                message = "Camera paused while the iPhone cools."
+            } else if level == .fair {
+                throttled = false
+                message = "Camera is warming up."
+            } else if level == .nominal {
+                throttled = false
+                message = nil
+            } else {
+                throttled = true
+                message = "Camera is managing device temperature."
+            }
+
+            if self.pressureThrottledPreview != throttled {
+                self.pressureThrottledPreview = throttled
+                self.setSelectivePreviewFrameRate(throttled ? 15 : 30)
+            }
+            DispatchQueue.main.async {
+                self.health = message.map(CameraHealth.pressure) ?? .ready
+            }
+            if level == .shutdown, self.session.isRunning { self.session.stopRunning() }
+        }
     }
 
     /// Re-activates the already-authorized recording route only when the
@@ -1150,12 +1437,14 @@ final class CameraController: NSObject, ObservableObject {
         UserDefaults.standard.set(mode.rawValue, forKey: "incam.media.naming.v1")
     }
 
-    private func readCapabilities(_ device: AVCaptureDevice) {
+    private func readCapabilities(_ device: AVCaptureDevice, resolution requestedResolution: VideoResolution? = nil) {
         let format = device.activeFormat
         let activeLens = Self.lensOption(device)
-        let rates = Set(format.videoSupportedFrameRateRanges.flatMap { range in
-            [24, 25, 30, 50, 60, 120].filter { Double($0) >= range.minFrameRate && Double($0) <= range.maxFrameRate }
-        }).sorted()
+        // The active format may be 4K/24 even though another format on this
+        // exact lens supports 4K/60. List rates for the selected resolution,
+        // then select the matching active format when the person chooses it.
+        let resolution = requestedResolution ?? videoResolution
+        let rates = Self.availableFrameRates(for: device, resolution: resolution)
         let photoFormats = photoOutput.availablePhotoCodecTypes.contains(.hevc) ? ["HEIF", "JPEG"] : ["JPEG"]
         let supportedResolutions = VideoResolution.allCases.filter {
             self.session.canSetSessionPreset(Self.sessionPreset(for: $0))
@@ -1176,6 +1465,12 @@ final class CameraController: NSObject, ObservableObject {
         }
         let rawSupported = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
         let hdrSupported = format.isVideoHDRSupported
+        let stabilizations: [VideoStabilization] = {
+            guard let connection = movieOutput.connection(with: .video) else { return [.off] }
+            return VideoStabilization.allCases.filter {
+                $0 == .off || (connection.isVideoStabilizationSupported && format.isVideoStabilizationModeSupported(Self.nativeStabilization(for: $0)))
+            }
+        }()
         let dimensions = photoOutput.maxPhotoDimensions
         let megapixels = max(1, Int((Double(dimensions.width) * Double(dimensions.height) / 1_000_000).rounded()))
         let value = CameraCapabilities(
@@ -1206,6 +1501,10 @@ final class CameraController: NSObject, ObservableObject {
             self.rawPhotoSupported = rawSupported
             self.videoHDRSupported = hdrSupported
             self.videoHDREnabled = device.isVideoHDREnabled
+            self.availableVideoStabilizations = stabilizations.isEmpty ? [.off] : stabilizations
+            if !self.availableVideoStabilizations.contains(self.videoStabilization) {
+                self.videoStabilization = self.availableVideoStabilizations.contains(.auto) ? .auto : .off
+            }
             // Preserve an explicit choice across camera capability refreshes.
             // A fresh session starts at 24 fps where the lens supports it.
             if !rates.contains(self.frameRate) {
@@ -1227,6 +1526,7 @@ final class CameraController: NSObject, ObservableObject {
 
     private func capturePhoto() {
         let requestedFormat = photoFormat
+        let requestedSpeed = photoSpeedMode
         DispatchQueue.main.async { self.isCapturingPhoto = true }
         queue.async { [weak self] in
             guard let self, self.sessionConfigured else {
@@ -1236,7 +1536,7 @@ final class CameraController: NSObject, ObservableObject {
             let codec: AVVideoCodecType = requestedFormat == "HEIF" && self.photoOutput.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
             self.rotate(self.photoOutput.connection(with: .video))
-            settings.photoQualityPrioritization = .quality
+            settings.photoQualityPrioritization = requestedSpeed == .responsive ? .speed : .quality
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
@@ -1247,6 +1547,7 @@ final class CameraController: NSObject, ObservableObject {
             self.rotate(self.movieOutput.connection(with: .video))
             self.recipeLock.lock()
             self.recordedRecipe = self.cameraColorRecipe
+            self.recordedOutputFramingAspect = self.outputFramingAspect
             self.recipeLock.unlock()
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString)
@@ -1264,14 +1565,15 @@ final class CameraController: NSObject, ObservableObject {
         queue.async { [weak self] in self?.movieOutput.stopRecording() }
     }
 
-    private func rotate(_ connection: AVCaptureConnection?) {
+    /// The main preview and optional Metal Color Mix preview are separate
+    /// AVFoundation connections. Mirror the latter at connection level after
+    /// its rotation is applied—never with a SwiftUI affine transform—so the
+    /// front camera cannot be inverted by a second flip.
+    private func rotate(_ connection: AVCaptureConnection?, mirrorsFrontPreview: Bool = false) {
         guard let connection else { return }
         if connection.isVideoMirroringSupported {
-            // Saved media stays in the physical camera orientation. The
-            // front-facing *preview* applies its own screen-space y-axis
-            // reflection below, avoiding an unexpected double flip in files.
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = false
+            connection.isVideoMirrored = mirrorsFrontPreview && input?.device.position == .front
         }
         if connection.isVideoRotationAngleSupported(captureRotation) {
             connection.videoRotationAngle = captureRotation
@@ -1329,28 +1631,40 @@ final class CameraController: NSObject, ObservableObject {
 
     private func startMotion() {
         guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
-        motion.deviceMotionUpdateInterval = 1.0 / 20
-        motion.startDeviceMotionUpdates(to: .main) { [weak self] motion, _ in
+        motion.deviceMotionUpdateInterval = 1.0 / 60
+        motion.startDeviceMotionUpdates(to: levelMotionQueue) { [weak self] motion, _ in
             guard let self, let motion else { return }
-            let roll = motion.attitude.roll * 180 / .pi
-            let pitch = motion.attitude.pitch * 180 / .pi
-            // Remap portrait-device attitude into the current screen axes.
-            // In landscape, the screen-horizontal tilt is device pitch rather
-            // than device roll; using raw roll here was why the old guide was
-            // visibly wrong by a large amount.
-            switch self.levelInterfaceOrientation {
-            case .landscapeRight:
-                self.levelRoll = pitch
-                self.levelPitch = -roll
-            case .landscapeLeft:
-                self.levelRoll = -pitch
-                self.levelPitch = roll
-            case .portraitUpsideDown:
-                self.levelRoll = -roll
-                self.levelPitch = -pitch
-            default:
-                self.levelRoll = roll
-                self.levelPitch = pitch
+            // Project gravity onto the display plane. Unlike attitude.roll,
+            // this remains well-behaved when the phone approaches vertical.
+            let rawRollRadians = atan2(-motion.gravity.x, -motion.gravity.y)
+
+            // Filter at sensor cadence, but do not ask SwiftUI to redraw the
+            // full camera screen sixty times per second. A 30 Hz indicator is
+            // visually smooth and leaves headroom for touch and capture.
+            let alpha = 0.15
+            self.filteredLevelRollRadians = alpha * rawRollRadians
+                + (1 - alpha) * self.filteredLevelRollRadians
+            var deviation = self.filteredLevelRollRadians
+                .truncatingRemainder(dividingBy: .pi / 2)
+            if deviation > .pi / 4 { deviation -= .pi / 2 }
+            if deviation < -.pi / 4 { deviation += .pi / 2 }
+            let deviationDegrees = abs(deviation * 180 / .pi)
+            let leveled = self.levelCenteredOnMotionQueue
+                ? deviationDegrees <= 1.5
+                : deviationDegrees <= 1.0
+            self.levelCenteredOnMotionQueue = leveled
+            let displayRadians = leveled
+                ? self.filteredLevelRollRadians - deviation
+                : self.filteredLevelRollRadians
+            let now = Date()
+            guard now.timeIntervalSince(self.lastLevelUIPublish) >= (1.0 / 30.0) else { return }
+            self.lastLevelUIPublish = now
+            let displayDegrees = displayRadians * 180 / .pi
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.levelMonitoringEnabled else { return }
+                self.levelIsCentered = leveled
+                self.levelRoll = displayDegrees
+                self.levelPitch = 0
             }
         }
     }
@@ -1369,8 +1683,12 @@ final class CameraController: NSObject, ObservableObject {
             startMotion()
         } else {
             motion.stopDeviceMotionUpdates()
+            filteredLevelRollRadians = 0
+            levelCenteredOnMotionQueue = false
+            lastLevelUIPublish = .distantPast
             levelRoll = 0
             levelPitch = 0
+            levelIsCentered = false
         }
     }
 
@@ -1382,6 +1700,48 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    private static func targetDimensions(for resolution: VideoResolution) -> (width: Int32, height: Int32) {
+        switch resolution {
+        case .p720: return (1280, 720)
+        case .p1080: return (1920, 1080)
+        case .p4K: return (3840, 2160)
+        }
+    }
+
+    private static func supports(_ format: AVCaptureDevice.Format,
+                                 resolution: VideoResolution,
+                                 frameRate: Int) -> Bool {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        let target = targetDimensions(for: resolution)
+        guard dimensions.width >= target.width, dimensions.height >= target.height else { return false }
+        return format.videoSupportedFrameRateRanges.contains {
+            Double(frameRate) >= $0.minFrameRate && Double(frameRate) <= $0.maxFrameRate
+        }
+    }
+
+    private static func availableFrameRates(for device: AVCaptureDevice,
+                                            resolution: VideoResolution) -> [Int] {
+        [24, 25, 30, 50, 60, 120].filter { rate in
+            device.formats.contains { supports($0, resolution: resolution, frameRate: rate) }
+        }
+    }
+
+    private static func preferredFormat(for device: AVCaptureDevice,
+                                        resolution: VideoResolution,
+                                        frameRate: Int) -> AVCaptureDevice.Format? {
+        let target = targetDimensions(for: resolution)
+        return device.formats
+            .filter { supports($0, resolution: resolution, frameRate: frameRate) }
+            .sorted { lhs, rhs in
+                let left = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
+                let right = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
+                let leftDistance = abs(Int(left.width - target.width)) + abs(Int(left.height - target.height))
+                let rightDistance = abs(Int(right.width - target.width)) + abs(Int(right.height - target.height))
+                return leftDistance < rightDistance
+            }
+            .first
+    }
+
     private static func nativeCodec(for codec: VideoCodec) -> AVVideoCodecType {
         switch codec {
         case .h264: return .h264
@@ -1389,6 +1749,24 @@ final class CameraController: NSObject, ObservableObject {
         case .proRes422LT: return .proRes422LT
         case .proRes422: return .proRes422
         case .proRes422HQ: return .proRes422HQ
+        }
+    }
+
+    private static func nativeStabilization(for value: VideoStabilization) -> AVCaptureVideoStabilizationMode {
+        switch value {
+        case .off: return .off
+        case .auto: return .auto
+        case .standard: return .standard
+        case .cinematic: return .cinematic
+        }
+    }
+
+    private static func stabilization(for value: AVCaptureVideoStabilizationMode) -> VideoStabilization {
+        switch value {
+        case .standard: return .standard
+        case .cinematic: return .cinematic
+        case .auto: return .auto
+        default: return .off
         }
     }
 
@@ -1504,11 +1882,31 @@ final class CameraController: NSObject, ObservableObject {
         return cameraColorRecipe
     }
 
+    private func currentOutputFramingAspect() -> CGFloat? {
+        recipeLock.lock()
+        defer { recipeLock.unlock() }
+        return outputFramingAspect
+    }
+
+    /// Returns a centered crop with the requested width / height. The source
+    /// remains otherwise untouched; this is the exact guide ratio chosen by
+    /// the person, never an arbitrary screen rectangle.
+    private static func cropRect(for extent: CGRect, aspect: CGFloat) -> CGRect {
+        guard extent.width > 0, extent.height > 0, aspect.isFinite, aspect > 0 else { return extent }
+        let sourceAspect = extent.width / extent.height
+        if sourceAspect > aspect {
+            let width = extent.height * aspect
+            return CGRect(x: extent.midX - width / 2, y: extent.minY, width: width, height: extent.height).integral
+        }
+        let height = extent.width / aspect
+        return CGRect(x: extent.minX, y: extent.midY - height / 2, width: extent.width, height: height).integral
+    }
+
     /// Applies Camera Colors to a completed movie, preserving its audio track.
     /// File output has no filtering hook, so this export is the reliable way to
     /// make the saved clip match the filtered live preview.
-    private func saveProcessedMovieIfNeeded(_ sourceURL: URL, recipe: CameraColorRecipe) {
-        guard recipe.hasVisibleAdjustments else {
+    private func saveProcessedMovieIfNeeded(_ sourceURL: URL, recipe: CameraColorRecipe, outputAspect: CGFloat?) {
+        guard recipe.hasVisibleAdjustments || outputAspect != nil else {
             saveToPhotos(sourceURL)
             return
         }
@@ -1517,10 +1915,19 @@ final class CameraController: NSObject, ObservableObject {
         // look as though it was lost when the person opens Gallery.
         let privateGalleryURL = persistMovie(sourceURL)
         let asset = AVURLAsset(url: sourceURL)
-        let composition = AVVideoComposition(asset: asset) { request in
-            let source = request.sourceImage.clampedToExtent()
-            let rendered = RecipeRenderer.render(source, recipe: recipe).cropped(to: request.sourceImage.extent)
+        let composition = AVMutableVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
+            let source = request.sourceImage
+            let cropped = outputAspect.map { source.cropped(to: Self.cropRect(for: source.extent, aspect: $0)) } ?? source
+            let rendered = recipe.hasVisibleAdjustments
+                ? RecipeRenderer.render(cropped.clampedToExtent(), recipe: recipe).cropped(to: cropped.extent)
+                : cropped
             request.finish(with: rendered, context: nil)
+        })
+        if let outputAspect {
+            composition.renderSize = Self.cropRect(
+                for: CGRect(origin: .zero, size: composition.renderSize),
+                aspect: outputAspect
+            ).size
         }
         guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             publish(message: "Camera Colors could not prepare this video for saving.")
@@ -1593,11 +2000,13 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
         if let error { publish(error); return }
         guard let data = photo.fileDataRepresentation() else { return }
         let recipe = currentRecipe()
-        guard recipe.hasVisibleAdjustments, let image = CIImage(data: data) else {
+        let outputAspect = currentOutputFramingAspect()
+        guard (recipe.hasVisibleAdjustments || outputAspect != nil), let image = CIImage(data: data) else {
             savePhoto(data)
             return
         }
-        let rendered = RecipeRenderer.render(image, recipe: recipe)
+        let cropped = outputAspect.map { image.cropped(to: Self.cropRect(for: image.extent, aspect: $0)) } ?? image
+        let rendered = recipe.hasVisibleAdjustments ? RecipeRenderer.render(cropped, recipe: recipe) : cropped
         guard let adjusted = RecipeRenderer.context.jpegRepresentation(of: rendered, colorSpace: CGColorSpaceCreateDeviceRGB()) else {
             savePhoto(data)
             return
@@ -1616,8 +2025,9 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
         if let error { publish(error); return }
         recipeLock.lock()
         let recipe = recordedRecipe
+        let outputAspect = recordedOutputFramingAspect
         recipeLock.unlock()
-        saveProcessedMovieIfNeeded(outputFileURL, recipe: recipe)
+        saveProcessedMovieIfNeeded(outputFileURL, recipe: recipe, outputAspect: outputAspect)
     }
 }
 

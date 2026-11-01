@@ -24,6 +24,9 @@ struct CompositionOverlay: View {
     let levelEnabled: Bool
     let roll: Double
     let pitch: Double
+    /// Calculated by CameraController from gravity with smoothing, snap, and
+    /// hysteresis; the view only draws that measured state.
+    let levelIsCentered: Bool
     let isPortrait: Bool
 
     /// Landscape 16:9 uses the preview's full visible rectangle after it has
@@ -78,7 +81,7 @@ struct CompositionOverlay: View {
                     .position(x: frame.midX, y: frame.midY)
 
                 if levelEnabled {
-                    HorizonLevel(roll: roll, pitch: pitch)
+                    HorizonLevel(roll: roll, isCentered: levelIsCentered)
                         .position(x: frame.midX, y: frame.midY)
                 }
             }
@@ -206,39 +209,24 @@ private struct GoldenSpiral: View {
 
 private struct HorizonLevel: View {
     let roll: Double
-    let pitch: Double
-    /// Sony-style camera levels need both screen-horizontal roll and the
-    /// phone's forward/back pitch. The wider tolerances avoid flashing green
-    /// from normal hand tremor, while the travel is deliberately bounded so
-    /// the reference never jumps away from the composition grid.
-    private var level: Bool { abs(roll) < 0.8 && abs(pitch) < 1.2 }
-    private var rollOffset: CGFloat { CGFloat(max(-28, min(28, roll * 1.7))) }
-    private var pitchOffset: CGFloat { CGFloat(max(-18, min(18, pitch * 1.25))) }
+    let isCentered: Bool
+    /// Gravity is measured in the phone sensor's portrait basis. In InCam's
+    /// landscape camera UI, that makes a level horizon appear vertical, so
+    /// the visual baseline is rotated a quarter turn. The bar is horizontal
+    /// when the phone is level and rolls around that baseline.
+    private var angle: Angle { .degrees(roll + 90) }
 
     var body: some View {
         ZStack {
-            // A quiet fixed center reference. It stays on the real center of
-            // the camera frame while the live, sensor-driven indicator moves.
-            HStack(spacing: 8) {
-                Capsule().fill(InCamTheme.ivory.opacity(0.24)).frame(width: 14, height: 2)
-                Capsule().fill(InCamTheme.ivory.opacity(0.28)).frame(width: 42, height: 2)
-                Capsule().fill(InCamTheme.ivory.opacity(0.24)).frame(width: 14, height: 2)
-            }
-            // The three live bars show how far the handset is off level. The
-            // middle is longer, all bars remain horizontal in landscape, and
-            // the set turns/glows green only when both axes agree at center.
-            HStack(spacing: 7) {
-                Capsule().fill(level ? InCamTheme.green : InCamTheme.ivory.opacity(0.88)).frame(width: 14, height: 2)
-                Capsule().fill(level ? InCamTheme.green : InCamTheme.ivory.opacity(0.94)).frame(width: 42, height: 3)
-                Capsule().fill(level ? InCamTheme.green : InCamTheme.ivory.opacity(0.88)).frame(width: 14, height: 2)
-            }
-            .shadow(color: level ? InCamTheme.green.opacity(0.95) : .clear, radius: level ? 7 : 0)
-            .offset(x: rollOffset, y: pitchOffset)
+            Capsule()
+                .fill(isCentered ? InCamTheme.green : InCamTheme.ivory.opacity(0.94))
+                .frame(width: 58, height: 2)
+                .rotationEffect(angle)
+            .shadow(color: isCentered ? InCamTheme.green.opacity(0.95) : .clear, radius: isCentered ? 7 : 0)
         }
-        .frame(width: 120, height: 54)
+        .frame(width: 140, height: 140)
         .shadow(color: .black.opacity(0.5), radius: 2)
-        .animation(.easeOut(duration: 0.10), value: roll)
-        .animation(.easeOut(duration: 0.10), value: pitch)
+        .animation(nil, value: roll)
     }
 }
 

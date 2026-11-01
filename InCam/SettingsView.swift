@@ -213,13 +213,13 @@ struct SavedMediaGallery: View {
     @ViewBuilder private var calendarContent: some View {
         switch scope {
         case .month:
-            CalendarGalleryGrid(month: $displayedMonth, media: model.media, onSelect: select) { date in
+            CalendarMonthAlbumGrid(month: $displayedMonth, media: model.media) { date in
                 focusedDate = date
                 withAnimation(.snappy) { scope = .week }
             }
         case .week:
-            CalendarWeekGallery(date: focusedDate, media: model.media, onSelect: select,
-                                onZoomIn: { date in
+            CalendarWeekGallery(date: focusedDate, media: model.media,
+                                onOpenDay: { date in
                                     focusedDate = date
                                     withAnimation(.snappy) { scope = .day }
                                 },
@@ -245,15 +245,15 @@ struct SavedMediaGallery: View {
 
 private enum CalendarGalleryScope { case month, week, day }
 
-/// An in-app capture calendar: each square is a calendar day, with a five
-/// point gutter around and between every square. It never reads Photos.app.
-private struct CalendarGalleryGrid: View {
+/// Album-style month view. A square represents a week and uses the first
+/// captured day in that week for its cover. Entering a week reveals the seven
+/// individual day squares; entering a day reveals that day's media.
+private struct CalendarMonthAlbumGrid: View {
     @Binding var month: Date
     let media: [InCamSavedMedia]
-    let onSelect: (InCamSavedMedia) -> Void
-    let onZoomIn: (Date) -> Void
+    let onOpenWeek: (Date) -> Void
     private let calendar = Calendar.current
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 5), count: 7)
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 5), count: 3)
     @State private var gridWidth: CGFloat = 1
     @State private var lastTouch = CGPoint(x: -1, y: -1)
 
@@ -261,17 +261,16 @@ private struct CalendarGalleryGrid: View {
         calendar.date(from: calendar.dateComponents([.year, .month], from: month)) ?? month
     }
 
-    private var dayMedia: [Date: [InCamSavedMedia]] {
-        Dictionary(grouping: media, by: { calendar.startOfDay(for: $0.createdAt) })
-    }
-
-    private var leadingBlanks: Int {
-        let weekday = calendar.component(.weekday, from: monthStart)
-        return (weekday - calendar.firstWeekday + 7) % 7
-    }
-
-    private var dayCount: Int {
-        calendar.range(of: .day, in: .month, for: monthStart)?.count ?? 0
+    private var weekStarts: [Date] {
+        guard let monthEnd = calendar.date(byAdding: .month, value: 1, to: monthStart),
+              var week = calendar.dateInterval(of: .weekOfYear, for: monthStart)?.start else { return [] }
+        var values: [Date] = []
+        while week < monthEnd {
+            values.append(week)
+            guard let next = calendar.date(byAdding: .day, value: 7, to: week) else { break }
+            week = next
+        }
+        return values
     }
 
     var body: some View {
@@ -287,12 +286,11 @@ private struct CalendarGalleryGrid: View {
                 }
                 .padding(.horizontal, 14)
 
-                weekdayHeader
-
                 LazyVGrid(columns: columns, spacing: 5) {
-                    ForEach(0..<leadingBlanks, id: \.self) { _ in Color.clear.aspectRatio(1, contentMode: .fit) }
-                    ForEach(1...dayCount, id: \.self) { day in
-                        dayCell(day)
+                    ForEach(weekStarts, id: \.self) { week in
+                        CalendarWeekTile(weekStart: week, captures: captures(in: week)) {
+                            onOpenWeek(week)
+                        }
                     }
                 }
                 .contentShape(Rectangle())
@@ -304,7 +302,7 @@ private struct CalendarGalleryGrid: View {
                 .simultaneousGesture(
                     MagnifyGesture().onEnded { value in
                         guard value.magnification > 1.12 else { return }
-                        onZoomIn(dateAtPinch)
+                        onOpenWeek(weekAtPinch)
                     }
                 )
                 // Five points on every edge and between every square.
@@ -312,16 +310,6 @@ private struct CalendarGalleryGrid: View {
                 .background(.white.opacity(0.42))
             }
         }
-    }
-
-    private var weekdayHeader: some View {
-        HStack(spacing: 5) {
-            ForEach(calendar.shortWeekdaySymbols, id: \.self) { day in
-                Text(day.prefix(1)).font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.secondary).frame(maxWidth: .infinity)
-            }
-        }
-        .padding(.horizontal, 5)
     }
 
     private var widthReader: some View {
@@ -332,26 +320,56 @@ private struct CalendarGalleryGrid: View {
         }
     }
 
-    private var dateAtPinch: Date {
-        guard gridWidth > 1, lastTouch.x >= 0, lastTouch.y >= 0 else {
-            return calendar.startOfDay(for: monthStart)
+    private var weekAtPinch: Date {
+        guard gridWidth > 1, lastTouch.x >= 0, lastTouch.y >= 0, !weekStarts.isEmpty else {
+            return weekStarts.first ?? monthStart
         }
-        let cell = (gridWidth - 30) / 7
-        let column = max(0, min(6, Int(lastTouch.x / (cell + 5))))
+        let cell = (gridWidth - 20) / 3
+        let column = max(0, min(2, Int(lastTouch.x / (cell + 5))))
         let row = max(0, Int(lastTouch.y / (cell + 5)))
-        let day = row * 7 + column - leadingBlanks + 1
-        guard (1...dayCount).contains(day) else { return calendar.startOfDay(for: monthStart) }
-        return calendar.date(byAdding: .day, value: day - 1, to: monthStart) ?? monthStart
+        let index = min(weekStarts.count - 1, row * 3 + column)
+        return weekStarts[index]
     }
 
-    @ViewBuilder private func dayCell(_ day: Int) -> some View {
-        let date = calendar.date(byAdding: .day, value: day - 1, to: monthStart) ?? monthStart
-        let captures = dayMedia[calendar.startOfDay(for: date)] ?? []
-        CalendarDayTile(date: date, captures: captures, onSelect: onSelect)
+    private func captures(in weekStart: Date) -> [InCamSavedMedia] {
+        guard let weekEnd = calendar.date(byAdding: .day, value: 7, to: weekStart) else { return [] }
+        return media.filter { $0.createdAt >= weekStart && $0.createdAt < weekEnd }
+            .sorted { $0.createdAt < $1.createdAt }
     }
 
     private func changeMonth(_ delta: Int) {
         month = calendar.date(byAdding: .month, value: delta, to: monthStart) ?? monthStart
+    }
+}
+
+private struct CalendarWeekTile: View {
+    let weekStart: Date
+    let captures: [InCamSavedMedia]
+    let action: () -> Void
+    private let calendar = Calendar.current
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: .bottomLeading) {
+                if let cover = captures.first {
+                    SavedMediaThumbnail(media: cover).clipped()
+                } else {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.white.opacity(0.055))
+                }
+                LinearGradient(colors: [.clear, .black.opacity(0.76)], startPoint: .top, endPoint: .bottom)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Week of \(weekStart.formatted(.dateTime.month(.abbreviated).day()))")
+                    Text(captures.isEmpty ? "No captures" : "\(captures.count) capture\(captures.count == 1 ? "" : "s")")
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .font(.system(size: 10, weight: .semibold))
+                .padding(7)
+            }
+            .aspectRatio(1, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Week of \(weekStart.formatted(.dateTime.month(.wide).day()))")
     }
 }
 
@@ -360,8 +378,7 @@ private struct CalendarGalleryGrid: View {
 private struct CalendarWeekGallery: View {
     let date: Date
     let media: [InCamSavedMedia]
-    let onSelect: (InCamSavedMedia) -> Void
-    let onZoomIn: (Date) -> Void
+    let onOpenDay: (Date) -> Void
     let onZoomOut: () -> Void
     private let calendar = Calendar.current
     @State private var stripWidth: CGFloat = 1
@@ -387,7 +404,9 @@ private struct CalendarWeekGallery: View {
                         VStack(spacing: 4) {
                             Text(day.formatted(.dateTime.weekday(.narrow)))
                                 .font(.caption2.weight(.bold)).foregroundStyle(.secondary)
-                            CalendarDayTile(date: day, captures: dayMedia[calendar.startOfDay(for: day)] ?? [], onSelect: onSelect)
+                            CalendarDayTile(date: day, captures: dayMedia[calendar.startOfDay(for: day)] ?? []) {
+                                onOpenDay(day)
+                            }
                         }
                     }
                 }
@@ -401,7 +420,7 @@ private struct CalendarWeekGallery: View {
                     .onChanged { lastTouch = $0.location })
                 .simultaneousGesture(MagnifyGesture().onEnded { value in
                     if value.magnification > 1.12 {
-                        onZoomIn(dayAtPinch)
+                        onOpenDay(dayAtPinch)
                     } else if value.magnification < 0.88 {
                         onZoomOut()
                     }
@@ -468,12 +487,12 @@ private struct CalendarDayGallery: View {
 private struct CalendarDayTile: View {
     let date: Date
     let captures: [InCamSavedMedia]
-    let onSelect: (InCamSavedMedia) -> Void
+    let onOpen: () -> Void
     private let calendar = Calendar.current
 
     var body: some View {
         Button {
-            if let media = captures.first { onSelect(media) }
+            onOpen()
         } label: {
             ZStack(alignment: .topLeading) {
                 if let media = captures.first {
@@ -502,7 +521,7 @@ private struct CalendarDayTile: View {
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
-        .disabled(captures.isEmpty)
+        .accessibilityLabel(date.formatted(.dateTime.weekday(.wide).month(.wide).day()))
     }
 }
 
@@ -679,6 +698,14 @@ struct SettingsView: View {
                 ForEach(camera.availableVideoCodecs) { Text($0.rawValue).tag($0) }
             }
             .disabled(camera.isRecording)
+            Picker("Stabilization", selection: Binding(get: { camera.videoStabilization }, set: { camera.setVideoStabilization($0) })) {
+                ForEach(camera.availableVideoStabilizations) { Text($0.rawValue).tag($0) }
+            }
+            .disabled(camera.isRecording || camera.availableVideoStabilizations.count < 2)
+            Text(camera.availableVideoStabilizations.count < 2
+                 ? "This lens and format do not offer video stabilization."
+                 : "Modes are shown only when the active lens and format support them. Stabilization can add a little capture latency.")
+                .font(.caption).foregroundStyle(.secondary)
             Section("Capture file naming") {
                 TextField("Folder (4–5 letters/numbers)", text: Binding(
                     get: { camera.recordingFolderName },
@@ -721,6 +748,17 @@ struct SettingsView: View {
             }
             .disabled(camera.isRecording)
             LabeledContent("RAW", value: camera.rawPhotoSupported ? "Supported" : "Unavailable on this format")
+            Picker("Photo responsiveness", selection: Binding(get: { camera.photoSpeedMode }, set: { camera.setPhotoSpeedMode($0) })) {
+                Text(PhotoSpeedMode.standard.rawValue).tag(PhotoSpeedMode.standard)
+                if camera.responsivePhotoCaptureSupported {
+                    Text(PhotoSpeedMode.responsive.rawValue).tag(PhotoSpeedMode.responsive)
+                }
+            }
+            .disabled(camera.isRecording || !camera.responsivePhotoCaptureSupported)
+            Text(camera.responsivePhotoCaptureSupported
+                 ? "Responsive uses supported Zero Shutter Lag buffers for quicker stills. It may use more memory and battery while selected."
+                 : "Responsive capture is unavailable on this camera format. Deferred photo delivery stays off so captures remain in InCam’s private gallery.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         Section("Photos from InCam") {
             Text("The in-app gallery contains only media saved by InCam. It does not browse your full Photos library.")
@@ -768,6 +806,8 @@ struct SettingsView: View {
 
     private var compositionSection: some View {
         Section {
+            Toggle("Save output in selected ratio", isOn: $preferences.saveFramedOutput)
+                .disabled(camera.isRecording)
             ForEach(CompositionRatio.catalog + preferences.ratioShortcuts.filter { !CompositionRatio.catalog.contains($0) }) { ratio in
                 let selected = preferences.ratioShortcuts.contains(ratio)
                 Button { preferences.toggleRatio(ratio) } label: {
@@ -783,7 +823,9 @@ struct SettingsView: View {
         } header: {
             Text("Ratios")
         } footer: {
-            Text("Ratios and grids are composition guides. They do not crop the saved video.")
+            Text(preferences.saveFramedOutput
+                 ? "InCam center-crops saved photos and exports completed videos to the selected ratio. Changing the guide while recording does not alter the clip already in progress."
+                 : "Ratios and grids are composition guides. Turn on Save output in selected ratio to crop saved photos and videos.")
         }
     }
 

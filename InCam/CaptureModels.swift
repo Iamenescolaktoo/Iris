@@ -48,6 +48,43 @@ enum VideoCodec: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// Stabilization is a property of the active video connection, not a promise
+/// that every lens, resolution, or frame rate can support every mode.
+enum VideoStabilization: String, CaseIterable, Codable, Identifiable {
+    case off = "Off"
+    case auto = "Auto"
+    case standard = "Standard"
+    case cinematic = "Cinematic"
+
+    var id: String { rawValue }
+}
+
+/// Still-photo speed modes deliberately exclude deferred photo delivery.
+/// Apple completes deferred proxies through the Photos library, while InCam's
+/// gallery stores only private, app-owned media.
+enum PhotoSpeedMode: String, CaseIterable, Codable, Identifiable {
+    case standard = "Standard"
+    case responsive = "Responsive"
+
+    var id: String { rawValue }
+}
+
+enum CameraHealth: Equatable {
+    case starting
+    case ready
+    case recovering(String)
+    case pressure(String)
+    case unavailable(String)
+
+    var message: String? {
+        switch self {
+        case .ready: return nil
+        case .starting: return "Starting camera…"
+        case .recovering(let message), .pressure(let message), .unavailable(let message): return message
+        }
+    }
+}
+
 /// The preferred channel layout requested from the selected microphone. The
 /// active route remains authoritative—some built-in iPhone microphones are
 /// physically mono and cannot provide a genuine right channel.
@@ -278,6 +315,10 @@ final class CameraScreenPreferences: ObservableObject {
     @Published var showCustom2: Bool { didSet { defaults.set(showCustom2, forKey: "incam.screen.c2") } }
     @Published var showMainControls: Bool { didSet { defaults.set(showMainControls, forKey: "incam.screen.controls") } }
     @Published var showQuickRow: Bool { didSet { defaults.set(showQuickRow, forKey: "incam.screen.quickRow") } }
+    /// Guides stay non-destructive by default. This opt-in asks the capture
+    /// pipeline to center-crop the private and Photos copies to the selected
+    /// guide after capture.
+    @Published var saveFramedOutput: Bool { didSet { defaults.set(saveFramedOutput, forKey: "incam.screen.save-framed-output") } }
     var framingGuide: Bool { !ratioShortcuts.isEmpty }
     @Published var selectedRatio: CompositionRatio { didSet { defaults.set(selectedRatio.rawValue, forKey: "incam.screen.ratio") } }
     @Published var ratioShortcuts: [CompositionRatio] {
@@ -291,6 +332,7 @@ final class CameraScreenPreferences: ObservableObject {
         showCustom2 = defaults.bool(forKey: "incam.screen.c2")
         showMainControls = defaults.object(forKey: "incam.screen.controls") as? Bool ?? true
         showQuickRow = defaults.object(forKey: "incam.screen.quickRow") as? Bool ?? true
+        saveFramedOutput = defaults.bool(forKey: "incam.screen.save-framed-output")
         selectedRatio = CompositionRatio(rawValue: defaults.string(forKey: "incam.screen.ratio") ?? "") ?? .fourThree
         let saved = (defaults.stringArray(forKey: "incam.screen.ratios") ?? []).compactMap(CompositionRatio.init(rawValue:))
         ratioShortcuts = defaults.object(forKey: "incam.screen.ratios") == nil ? [.fourThree, .sixteenNine, .square] : saved.reduce(into: []) { if !$0.contains($1) { $0.append($1) } }

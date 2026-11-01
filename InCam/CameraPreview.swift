@@ -8,6 +8,7 @@ import UIKit
 /// preview view present the newest one without coupling capture code to UIKit.
 protocol SelectiveColorPreviewSink: AnyObject {
     func setSelectiveColorPreviewActive(_ active: Bool)
+    func setSelectiveColorPreviewFrameRate(_ framesPerSecond: Int)
     func submitSelectiveColorFrame(_ pixelBuffer: CVPixelBuffer, recipe: CameraColorRecipe)
 }
 
@@ -75,6 +76,7 @@ final class PreviewHostView: UIView, UIGestureRecognizerDelegate {
     private let readoutRailExclusionWidth: CGFloat = 92
     private var appliedOrientation: UIInterfaceOrientation = .unknown
     private var appliedFrontCameraState: Bool?
+    private var hasTriggeredLensPinch = false
     let selectiveColorPreview = MetalColorPreviewView()
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
@@ -102,11 +104,21 @@ final class PreviewHostView: UIView, UIGestureRecognizerDelegate {
 
     @objc func zoomPinched(_ gesture: UIPinchGestureRecognizer) {
         switch gesture.state {
-        case .ended:
+        case .began:
+            hasTriggeredLensPinch = false
+        case .changed:
+            guard !hasTriggeredLensPinch else { return }
             // At either physical-lens end the controller does nothing instead
             // of silently falling back to digital zoom.
-            if gesture.scale >= 1.16 { onLensPinch?(true) }
-            else if gesture.scale <= 0.84 { onLensPinch?(false) }
+            if gesture.scale >= 1.16 {
+                hasTriggeredLensPinch = true
+                onLensPinch?(true)
+            } else if gesture.scale <= 0.84 {
+                hasTriggeredLensPinch = true
+                onLensPinch?(false)
+            }
+        case .ended, .cancelled, .failed:
+            hasTriggeredLensPinch = false
         default:
             break
         }
@@ -146,15 +158,16 @@ final class PreviewHostView: UIView, UIGestureRecognizerDelegate {
         appliedFrontCameraState = isFrontCamera
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = false
+            // Use the capture connection's horizontal-mirror feature rather
+            // than applying an affine transform after rotation. A transformed
+            // layer was the source of the apparent vertical/upside-down flip.
+            connection.isVideoMirrored = isFrontCamera
         }
-        // The front preview deliberately uses a horizontal selfie reflection
-        // (scale X only). It is applied after orientation, so a camera swap
-        // cannot create the prior upside-down x-axis inversion. Capture files
-        // remain unmirrored by CameraController.rotate(_:).
-        let transform = isFrontCamera ? CGAffineTransform(scaleX: -1, y: 1) : .identity
-        previewLayer.setAffineTransform(transform)
-        selectiveColorPreview.transform = transform
+        previewLayer.setAffineTransform(.identity)
+        // The Color Mix stream uses AVFoundation connection mirroring too.
+        // Keep its view untransformed: a second screen-space flip after
+        // rotation was the cause of the inverted front-camera preview.
+        selectiveColorPreview.transform = .identity
         if connection.isVideoRotationAngleSupported(orientation.cameraRotationAngle) {
             connection.videoRotationAngle = orientation.cameraRotationAngle
         }
@@ -218,6 +231,16 @@ final class MetalColorPreviewView: UIView, SelectiveColorPreviewSink, MTKViewDel
             guard let self else { return }
             self.metalView.isHidden = !active
             self.metalView.isPaused = !active
+        }
+    }
+
+    /// Heat recovery reduces only the optional graded preview cadence. The
+    /// selected recording resolution, frame rate, lens and exposure remain
+    /// untouched, and the normal cadence returns after pressure subsides.
+    func setSelectiveColorPreviewFrameRate(_ framesPerSecond: Int) {
+        let rate = max(15, min(30, framesPerSecond))
+        DispatchQueue.main.async { [weak self] in
+            self?.metalView.preferredFramesPerSecond = rate
         }
     }
 

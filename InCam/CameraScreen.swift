@@ -1,4 +1,5 @@
 import AVFoundation
+import AVKit
 import SwiftUI
 
 struct CameraScreen: View {
@@ -32,6 +33,7 @@ struct CameraScreen: View {
     @State private var focusTarget: CGPoint?
     @State private var focusTargetDismissWorkItem: DispatchWorkItem?
     @State private var focusInspector = false
+    @State private var focusInspectorDismissWorkItem: DispatchWorkItem?
     @State private var exposureInspector = false
     @State private var exposureTarget = CGPoint(x: 0.5, y: 0.5)
     @State private var exposureTargetPulse: CGFloat = 1
@@ -157,7 +159,7 @@ struct CameraScreen: View {
                 CompositionOverlay(safeLeft: orientation.windowSafeAreaInsets.left, safeRight: orientation.windowSafeAreaInsets.right,
                                    adjustmentExpanded: adjustmentExpanded, rightControls: rightControls,
                                    framingEnabled: preferences.framingGuide, ratio: ratio, grid: grid, gridDensity: gridDensity, levelEnabled: levelEnabled,
-                                   roll: camera.levelRoll, pitch: camera.levelPitch, isPortrait: portrait)
+                                   roll: camera.levelRoll, pitch: camera.levelPitch, levelIsCentered: camera.levelIsCentered, isPortrait: portrait)
                     .animation(.spring(response: 0.34, dampingFraction: 0.9), value: ratio)
 
                 if adjustmentExpanded || focusInspector || exposureInspector || colorDockExpanded || audioInspectorOpen || showGridChoices || showRatioChoices || showFormatChoices {
@@ -227,13 +229,18 @@ struct CameraScreen: View {
                             .frame(width: rightControls, height: max(1, proxy.size.height - 96))
                             .contentShape(Rectangle())
                             .position(x: captureCenter.x, y: 96 + max(1, proxy.size.height - 96) / 2)
-                            .onTapGesture { focusInspector = false }
+                            .onTapGesture {
+                                cancelFocusInspectorDismissal()
+                                focusInspector = false
+                            }
                             .gesture(DragGesture(minimumDistance: 6)
                                 .onChanged { drag in
+                                    cancelFocusInspectorDismissal()
                                     focusInspector = true
                                     let position = Float(min(1, max(0, 1 - drag.location.y / max(1, proxy.size.height))))
                                     camera.setFocus(auto: false, position: position)
-                                })
+                                }
+                                .onEnded { _ in scheduleFocusInspectorDismissal() })
                             .zIndex(3)
                     }
                     if !focusInspector && !adjustmentExpanded && !colorDockExpanded {
@@ -249,10 +256,14 @@ struct CameraScreen: View {
                             Text("FOCUS").font(.system(size: 10, weight: .medium))
                             Text("FAR").font(.system(size: 9))
                             PrecisionRuler(value: Binding(get: { Double(camera.focusPosition) }, set: {
+                                cancelFocusInspectorDismissal()
                                 camera.setFocus(auto: false, position: Float($0))
                             }), range: 0...1, step: 0.02, verticalHeight: 112, showsValue: false) { _ in "Manual focus" }
                                 .environment(\.verticalCameraRuler, true)
                                 .accessibilityIdentifier("focus.manualRuler")
+                                .simultaneousGesture(DragGesture(minimumDistance: 0)
+                                    .onChanged { _ in cancelFocusInspectorDismissal() }
+                                    .onEnded { _ in scheduleFocusInspectorDismissal() })
                             Text("NEAR").font(.system(size: 9))
                         }
                         .frame(width: 64)
@@ -312,11 +323,16 @@ struct CameraScreen: View {
         .foregroundStyle(InCamTheme.ivory)
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
+        .modifier(PhysicalCaptureEventModifier(
+            enabled: scenePhase == .active && !showSettings && !showGallery,
+            capture: { camera.capture() }
+        ))
         .onAppear {
             if !photoEnabled && camera.mode == .photo && !camera.isRecording { camera.toggleMode() }
             camera.setCaptureRotation(orientation.rotationAngle)
             camera.setLevelInterfaceOrientation(orientation.interfaceOrientation)
             camera.setLevelMonitoringEnabled(levelEnabled)
+            updateOutputFraming()
             updateCameraActivity()
             grid = GridMode(rawValue: savedGridMode) ?? .off
             lastGrid = GridMode(rawValue: savedLastGridMode) ?? .thirds
@@ -353,6 +369,8 @@ struct CameraScreen: View {
         }
         .onChange(of: gridDensity) { _, newValue in savedGridDensity = min(6, max(2, newValue)) }
         .onChange(of: levelEnabled) { _, enabled in camera.setLevelMonitoringEnabled(enabled) }
+        .onChange(of: preferences.selectedRatio) { _, _ in updateOutputFraming() }
+        .onChange(of: preferences.saveFramedOutput) { _, _ in updateOutputFraming() }
         .onChange(of: colorControls.recipe) { _, recipe in camera.setCameraColorRecipe(recipe) }
         .onChange(of: camera.logModeEnabled) { _, enabled in
             // Do not leave a hidden Saturation/Contrast dial active in Log.
@@ -361,7 +379,10 @@ struct CameraScreen: View {
             }
             camera.setCameraColorRecipe(colorControls.recipe)
         }
-        .onChange(of: camera.isRecording) { _, recording in orientation.setRecording(recording) }
+        .onChange(of: camera.isRecording) { _, recording in
+            orientation.setRecording(recording)
+            if !recording { updateOutputFraming() }
+        }
         .onChange(of: camera.exposureLocked) { _, locked in
             dismissAdjustment()
             if locked { colorDockExpanded = false }
@@ -385,6 +406,7 @@ struct CameraScreen: View {
             }
         }
         .onChange(of: colorDockExpanded) { _, expanded in
+            camera.setCameraColorsPreviewEnabled(expanded)
             if expanded {
                 dismissAdjustment()
                 openShortcutSide = nil
@@ -493,6 +515,20 @@ struct CameraScreen: View {
                 }
                 .accessibilityAction(named: Text("Lock exposure at center")) { openExposure(at: CGPoint(x: 0.5, y: 0.5)) }
                 .ignoresSafeArea()
+                .overlay(alignment: .top) {
+                    if let message = camera.health.message {
+                        Text(message)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(InCamTheme.ivory)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(.black.opacity(0.58), in: Capsule())
+                            .padding(.top, 12)
+                            .allowsHitTesting(false)
+                            .accessibilityLabel(message)
+                    }
+                }
         } else {
             ZStack {
                 LinearGradient(colors: [.black, Color(white: 0.16), .black], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -735,6 +771,7 @@ struct CameraScreen: View {
     }
 
     private func dismissAdjustment() {
+        cancelFocusInspectorDismissal()
         focusInspector = false
         exposureInspector = false
         expandedDock = nil
@@ -776,6 +813,30 @@ struct CameraScreen: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.25, execute: work)
     }
 
+    /// The ruler is a temporary second view over Record. Moving it locks the
+    /// chosen focus position; releasing it for a moment restores Record while
+    /// leaving that manual focus intact, including during a recording.
+    private func scheduleFocusInspectorDismissal() {
+        focusInspectorDismissWorkItem?.cancel()
+        let work = DispatchWorkItem { focusInspector = false }
+        focusInspectorDismissWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+
+    private func cancelFocusInspectorDismissal() {
+        focusInspectorDismissWorkItem?.cancel()
+        focusInspectorDismissWorkItem = nil
+    }
+
+    private func updateOutputFraming() {
+        guard !camera.isRecording, preferences.saveFramedOutput, preferences.framingGuide else {
+            if !camera.isRecording { camera.setOutputFraming(aspect: nil) }
+            return
+        }
+        let aspect = orientation.interfaceOrientation.isPortrait ? 1 / ratio.value : ratio.value
+        camera.setOutputFraming(aspect: aspect)
+    }
+
     private func clearFocusTarget() {
         focusTargetDismissWorkItem?.cancel()
         focusTargetDismissWorkItem = nil
@@ -789,6 +850,10 @@ struct CameraScreen: View {
     private func transientControlsDismissalLayer(cameraRight: CGFloat, height: CGFloat) -> some View {
         Color.black.opacity(0.001)
             .contentShape(Rectangle())
+            // Keep this invisible tap catcher inside the live image. A
+            // full-screen catcher can otherwise absorb dock/right-pad taps.
+            .frame(width: cameraRight, height: height)
+            .position(x: cameraRight / 2, y: height / 2)
             .gesture(SpatialTapGesture(count: 2).exclusively(before: SpatialTapGesture()).onEnded { value in
                 switch value {
                 case .first(let tap):
@@ -804,16 +869,14 @@ struct CameraScreen: View {
 
     private var previewFocusModes: some View {
         Button {
-            // Capture the current mode before the asynchronous device lock so
-            // the MF ruler opens on the first AF → MF tap (not one tap late).
-            let enteringManualFocus = camera.focusAuto
             dismissAdjustment()
             colorDockExpanded = false
             showGridChoices = false
             showRatioChoices = false
             focusTarget = nil
-            camera.setFocus(auto: !enteringManualFocus)
-            focusInspector = enteringManualFocus
+            // Opening AF shows the current live lens position. It does not
+            // lock focus until the person actually moves the ruler.
+            focusInspector = true
         } label: {
             Text(camera.focusAuto ? "AF" : "MF")
                 .font(.system(size: 11, weight: .semibold))
@@ -826,8 +889,13 @@ struct CameraScreen: View {
         .buttonStyle(.plain)
         .accessibilityLabel("Focus mode")
         .accessibilityValue(camera.focusAuto ? "AF" : "MF")
-        .accessibilityHint(camera.focusAuto ? "Switch to manual focus lock" : "Switch to continuous autofocus")
+        .accessibilityHint("Tap to show focus. Adjust to lock manual focus; double-tap to return to autofocus")
         .accessibilityIdentifier("focus.toggle")
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            cancelFocusInspectorDismissal()
+            camera.setFocus(auto: true)
+            focusInspector = false
+        })
     }
 
     /// Lives above WB in the same compact trailing rail as AF/MF and the
@@ -1089,6 +1157,25 @@ struct CameraScreen: View {
     private func format(_ interval: TimeInterval) -> String {
         let seconds = Int(interval)
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+}
+
+/// Camera Control / supported hardware capture events are routed through the
+/// same capture path as the red button. Unsupported iPhones keep the regular
+/// on-screen controls without a fallback gesture that could steal volume keys.
+private struct PhysicalCaptureEventModifier: ViewModifier {
+    let enabled: Bool
+    let capture: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onCameraCaptureEvent(isEnabled: enabled) { event in
+                if event.phase == .ended { capture() }
+            }
+        } else {
+            content
+        }
     }
 }
 
@@ -1729,7 +1816,7 @@ private struct CaptureFormatToolStack: View {
     }
 
     private func cycleFrameRate() {
-        let choices = camera.capabilities.frameRates.filter { [24, 25, 30].contains($0) }
+        let choices = camera.capabilities.frameRates.filter { [24, 25, 30, 60].contains($0) }
         guard let index = choices.firstIndex(of: camera.frameRate), !choices.isEmpty else { return }
         camera.setFrameRate(choices[(index + 1) % choices.count])
     }
