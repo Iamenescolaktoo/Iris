@@ -2,6 +2,10 @@
 
 This is the plain-language record of completed product changes. It complements `SOURCES.md`, which records technical sources and limitations.
 
+## November 1, 2026
+
+- **Settings Home V1.4:** Replaced the prior compact four-category overview with the approved paged icon grid. Page one is **My Menu, Video, Audio, Photo, Monitoring, Color**; page two is **Recording, Focus, Exposure**. Each tile keeps a recognizable icon and readable title, with no tile descriptions. Swiping moves between the two pages, and returning from any category restores the page the person came from. This update changes only Settings Home and its route labels; the camera viewfinder, capture rail, gestures, Gallery route, and Camera Color workflow are preserved.
+
 ## October 31, 2026
 
 - **Landscape level orientation:** The gravity-derived level visual now adds the required 90° landscape baseline, so it rests horizontally when the phone is level instead of appearing as a vertical line.

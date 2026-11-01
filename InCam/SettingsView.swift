@@ -614,54 +614,99 @@ struct SettingsView: View {
     @AppStorage("incam.settings.favorite.looks") private var favoriteLooks = true
     @AppStorage("incam.settings.favorite.screen") private var favoriteScreen = false
     @ObservedObject private var orientation = CameraOrientation.shared
-    @State private var category: SettingsCategory = .favorites
+    /// `nil` is the V1.4 Settings Home. Keeping the page index in this view
+    /// means a back action from any submenu returns to the same swipe page.
+    @State private var category: SettingsCategory?
+    @State private var settingsHomePage = 0
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                // The overview is a compact set of icon tiles. Selecting one
-                // keeps the familiar detailed settings list below it.
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
-                    ForEach(SettingsCategory.allCases) { tab in
-                        Button { category = tab } label: {
-                            VStack(spacing: 5) {
-                                Image(systemName: tab.icon)
-                                    .font(.system(size: 16, weight: .semibold))
-                                Text(tab.rawValue)
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .lineLimit(1)
-                            }
-                            .foregroundStyle(category == tab ? .yellow : InCamTheme.ivory.opacity(0.72))
-                            .frame(maxWidth: .infinity, minHeight: 58)
-                            .glass(in: RoundedRectangle(cornerRadius: 14, style: .continuous), emphasized: category == tab)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Show \(tab.rawValue) settings")
-                        .accessibilityAddTraits(category == tab ? .isSelected : [])
-                    }
+            Group {
+                if let category {
+                    settingsDetail(for: category)
+                } else {
+                    settingsHome
                 }
-                .padding(.horizontal)
-                .padding(.vertical, 10)
-
-                List {
-                    switch category {
-                    case .favorites: favoritesSettings
-                    case .video: videoSettings
-                    case .photo: photoSettings
-                    case .audio: audioSettings
-                    }
-                }
-                .scrollContentBackground(.hidden)
             }
             .background(InCamTheme.graphite)
             .tint(InCamTheme.ivory)
-            .navigationTitle("Settings")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
+        }
+    }
+
+    /// The V1.4 home is deliberately just the requested paged 3 × 2 grid.
+    /// Descriptions belong to detail pages, not to the category tiles.
+    private var settingsHome: some View {
+        TabView(selection: $settingsHomePage) {
+            settingsHomePageGrid(SettingsCategory.firstPage)
+                .tag(0)
+            settingsHomePageGrid(SettingsCategory.secondPage)
+                .tag(1)
+        }
+        .tabViewStyle(.page(indexDisplayMode: .always))
+        .indexViewStyle(.page(backgroundDisplayMode: .always))
+        .navigationTitle("Camera Settings")
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Done") { dismiss() }
+            }
+        }
+        .accessibilityIdentifier("settings.home")
+    }
+
+    private func settingsHomePageGrid(_ categories: [SettingsCategory]) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 18), count: 3), spacing: 18) {
+            ForEach(categories) { category in
+                Button { self.category = category } label: {
+                    VStack(spacing: 14) {
+                        Image(systemName: category.icon)
+                            .font(.system(size: 29, weight: .medium))
+                            .frame(height: 32)
+                        Text(category.rawValue)
+                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                    .foregroundStyle(InCamTheme.ivory)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 150)
+                    .background(Color(red: 0.15, green: 0.17, blue: 0.20), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                }
+                .buttonStyle(PressScaleStyle())
+                .accessibilityLabel("Open \(category.rawValue) settings")
+                .accessibilityIdentifier("settings.category.\(category.id)")
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 32)
+        .padding(.bottom, 44)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder
+    private func settingsDetail(for category: SettingsCategory) -> some View {
+        List {
+            switch category {
+            case .myMenu: favoritesSettings
+            case .video: videoSettings
+            case .audio: audioSettings
+            case .photo: photoSettings
+            case .monitoring: monitoringSettings
+            case .color: colorSettings
+            case .recording: recordingSettings
+            case .focus: focusSettings
+            case .exposure: exposureSettings
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .navigationTitle(category.rawValue)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button { self.category = nil } label: {
+                    Label("Camera Settings", systemImage: "chevron.left")
                 }
             }
         }
+        .accessibilityIdentifier("settings.detail.\(category.id)")
     }
 
     /// Favorites is a small personal menu, not a duplicate settings screen.
@@ -777,6 +822,69 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder private var monitoringSettings: some View {
+        Section("Monitoring") {
+            Toggle("Leveler", isOn: Binding(
+                get: { UserDefaults.standard.bool(forKey: "incam.composition.level.enabled") },
+                set: { UserDefaults.standard.set($0, forKey: "incam.composition.level.enabled") }
+            ))
+            Toggle("Show audio meters", isOn: .constant(true))
+                .disabled(true)
+            Text("Level, grid and meter overlays affect the viewfinder only; they are never recorded into media.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var colorSettings: some View {
+        Section("Camera Color") {
+            NavigationLink { CameraColorLibraryView() } label: {
+                settingsLabel("Camera Color Studio", "camera.filters")
+            }
+            Text("Color Styles are edited here. The viewfinder only selects None or assigned C1–C9 profiles.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var recordingSettings: some View {
+        Section("File naming") {
+            TextField("Folder (4–5 letters/numbers)", text: Binding(
+                get: { camera.recordingFolderName },
+                set: { camera.setRecordingFolderName($0) }))
+                .textInputAutocapitalization(.characters)
+                .disabled(camera.recordingNamingMode == .date || camera.isRecording)
+            TextField("App prefix", text: Binding(
+                get: { camera.recordingPrefix },
+                set: { camera.setRecordingPrefix($0) }))
+                .textInputAutocapitalization(.characters)
+                .disabled(camera.recordingNamingMode == .date || camera.isRecording)
+            Picker("Folder style", selection: Binding(get: { camera.recordingNamingMode }, set: { camera.setRecordingNamingMode($0) })) {
+                ForEach(RecordingNamingMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .disabled(camera.isRecording)
+        }
+        Section("Capture status") {
+            Text("Storage estimates and recording recovery are device- and destination-dependent.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var focusSettings: some View {
+        Section("Autofocus") {
+            LabeledContent("Current mode", value: camera.focusAuto ? "AF" : "MF")
+            Text("The compact viewfinder AF/MF button remains the only mode switch. Focus behavior is stored per capture mode as support is added.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var exposureSettings: some View {
+        Section("Exposure") {
+            LabeledContent("Shutter display", value: camera.shutterAngleMode ? "Angle" : "Speed")
+            Text("Double-tap the shutter value to switch between Speed and Angle without changing the actual duration.")
+                .font(.footnote).foregroundStyle(.secondary)
+            LabeledContent("Exposure compensation", value: String(format: "%+.1f EV", camera.exposureBias))
+        }
+    }
+
     private var zoomSection: some View {
         Section("Zoom") {
             Picker("Maximum zoom", selection: Binding(get: { Double(camera.zoomCap) }, set: { camera.setZoomCap(CGFloat($0)) })) {
@@ -840,20 +948,33 @@ struct SettingsView: View {
     }
 }
 
-private enum SettingsCategory: String, CaseIterable, Identifiable {
-    case favorites = "Favorites"
+private enum SettingsCategory: String, Identifiable {
+    case myMenu = "My Menu"
     case video = "Video"
-    case photo = "Photo"
     case audio = "Audio"
+    case photo = "Photo"
+    case monitoring = "Monitoring"
+    case color = "Color"
+    case recording = "Recording"
+    case focus = "Focus"
+    case exposure = "Exposure"
+
+    static let firstPage: [SettingsCategory] = [.myMenu, .video, .audio, .photo, .monitoring, .color]
+    static let secondPage: [SettingsCategory] = [.recording, .focus, .exposure]
 
     var id: String { rawValue }
 
     var icon: String {
         switch self {
-        case .favorites: return "star.fill"
-        case .video: return "video.fill"
-        case .photo: return "camera.fill"
-        case .audio: return "waveform"
+        case .myMenu: return "star"
+        case .video: return "video"
+        case .audio: return "mic"
+        case .photo: return "camera"
+        case .monitoring: return "chart.bar"
+        case .color: return "paintpalette"
+        case .recording: return "record.circle"
+        case .focus: return "viewfinder"
+        case .exposure: return "sun.max"
         }
     }
 }
