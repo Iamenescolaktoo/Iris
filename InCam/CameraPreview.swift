@@ -158,16 +158,17 @@ final class PreviewHostView: UIView, UIGestureRecognizerDelegate {
         appliedFrontCameraState = isFrontCamera
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            // Use the capture connection's horizontal-mirror feature rather
-            // than applying an affine transform after rotation. A transformed
-            // layer was the source of the apparent vertical/upside-down flip.
-            connection.isVideoMirrored = isFrontCamera
+            // The front viewfinder is deliberately a 180° presentation flip,
+            // not a selfie mirror. Keeping the connection unmirrored makes
+            // the preview and the Color Mix presentation use one identical
+            // two-axis transform below.
+            connection.isVideoMirrored = false
         }
-        previewLayer.setAffineTransform(.identity)
-        // The Color Mix stream uses AVFoundation connection mirroring too.
-        // Keep its view untransformed: a second screen-space flip after
-        // rotation was the cause of the inverted front-camera preview.
-        selectiveColorPreview.transform = .identity
+        let presentationTransform = isFrontCamera
+            ? CGAffineTransform(scaleX: -1, y: -1)
+            : .identity
+        previewLayer.setAffineTransform(presentationTransform)
+        selectiveColorPreview.transform = presentationTransform
         if connection.isVideoRotationAngleSupported(orientation.cameraRotationAngle) {
             connection.videoRotationAngle = orientation.cameraRotationAngle
         }

@@ -288,7 +288,7 @@ final class CameraController: NSObject, ObservableObject {
             self.captureRotation = angle
             // The native preview layer rotates itself, while the Color Mix
             // video-data connection needs the same update explicitly.
-            self.rotate(self.selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
+            self.rotate(self.selectivePreviewOutput.connection(with: .video))
         }
     }
 
@@ -340,7 +340,7 @@ final class CameraController: NSObject, ObservableObject {
             ]
             selectivePreviewOutput.setSampleBufferDelegate(self, queue: selectivePreviewQueue)
             session.addOutput(selectivePreviewOutput)
-            rotate(selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
+            rotate(selectivePreviewOutput.connection(with: .video))
             setSelectivePreviewPresentation(true)
         } else {
             if session.outputs.contains(selectivePreviewOutput) {
@@ -467,7 +467,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.session.addInput(replacement)
                 self.input = replacement
                 self.session.commitConfiguration()
-                self.rotate(self.selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
+                self.rotate(self.selectivePreviewOutput.connection(with: .video))
                 self.observeZoom(device)
                 self.observeAutoReadouts(device)
                 self.readCapabilities(device)
@@ -556,7 +556,7 @@ final class CameraController: NSObject, ObservableObject {
                 self.session.addInput(replacement)
                 self.input = replacement
                 self.session.commitConfiguration()
-                self.rotate(self.selectivePreviewOutput.connection(with: .video), mirrorsFrontPreview: true)
+                self.rotate(self.selectivePreviewOutput.connection(with: .video))
                 self.observeZoom(device)
                 self.observeAutoReadouts(device)
                 self.readCapabilities(device)
@@ -1566,14 +1566,13 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     /// The main preview and optional Metal Color Mix preview are separate
-    /// AVFoundation connections. Mirror the latter at connection level after
-    /// its rotation is applied—never with a SwiftUI affine transform—so the
-    /// front camera cannot be inverted by a second flip.
-    private func rotate(_ connection: AVCaptureConnection?, mirrorsFrontPreview: Bool = false) {
+    /// AVFoundation connections. The viewfinder owns its front-camera
+    /// presentation transform, so this data connection stays unmirrored.
+    private func rotate(_ connection: AVCaptureConnection?) {
         guard let connection else { return }
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = mirrorsFrontPreview && input?.device.position == .front
+            connection.isVideoMirrored = false
         }
         if connection.isVideoRotationAngleSupported(captureRotation) {
             connection.videoRotationAngle = captureRotation

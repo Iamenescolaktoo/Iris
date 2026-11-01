@@ -644,41 +644,47 @@ struct SettingsView: View {
         }
         .tabViewStyle(.page(indexDisplayMode: .always))
         .indexViewStyle(.page(backgroundDisplayMode: .always))
-        .navigationTitle("Camera Settings")
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Button("Done") { dismiss() }
-            }
-        }
+        .toolbar(.hidden, for: .navigationBar)
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 24)
+                .onEnded { value in
+                    // A deliberate upward swipe closes the sheet; horizontal
+                    // drags remain owned by the paged category navigation.
+                    guard abs(value.translation.height) > abs(value.translation.width),
+                          value.translation.height < -60 else { return }
+                    dismiss()
+                }
+        )
         .accessibilityIdentifier("settings.home")
     }
 
     private func settingsHomePageGrid(_ categories: [SettingsCategory]) -> some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 18), count: 3), spacing: 18) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
             ForEach(categories) { category in
                 Button { self.category = category } label: {
-                    VStack(spacing: 14) {
+                    VStack(spacing: 9) {
                         Image(systemName: category.icon)
-                            .font(.system(size: 29, weight: .medium))
-                            .frame(height: 32)
+                            .font(.system(size: 23, weight: .medium))
+                            .frame(height: 26)
                         Text(category.rawValue)
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
                             .lineLimit(1)
                             .minimumScaleFactor(0.75)
                     }
                     .foregroundStyle(InCamTheme.ivory)
                     .frame(maxWidth: .infinity)
-                    .frame(height: 150)
-                    .background(Color(red: 0.15, green: 0.17, blue: 0.20), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .frame(height: 106)
+                    .background(Color(red: 0.15, green: 0.17, blue: 0.20), in: RoundedRectangle(cornerRadius: 19, style: .continuous))
                 }
                 .buttonStyle(PressScaleStyle())
                 .accessibilityLabel("Open \(category.rawValue) settings")
                 .accessibilityIdentifier("settings.category.\(category.id)")
             }
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 32)
-        .padding(.bottom, 44)
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 34)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
@@ -702,8 +708,10 @@ struct SettingsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button { self.category = nil } label: {
-                    Label("Camera Settings", systemImage: "chevron.left")
+                    Image(systemName: "chevron.left")
+                        .frame(width: 44, height: 44)
                 }
+                .accessibilityLabel("Back to settings")
             }
         }
         .accessibilityIdentifier("settings.detail.\(category.id)")

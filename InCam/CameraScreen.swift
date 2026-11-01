@@ -580,8 +580,13 @@ struct CameraScreen: View {
     }
 
     private var shutterReadout: String {
+        // Speed mode reflects the live automatic exposure. Angle mode holds
+        // its chosen value steady until the person changes shutter or FPS.
+        let displaySeconds = camera.shutterAngleMode
+            ? camera.lastManualExposureSeconds
+            : camera.exposureSeconds
         let seconds = CameraExposureDefaults.displayDuration(
-            for: camera.exposureSeconds,
+            for: displaySeconds,
             frameRate: camera.frameRate,
             angleMode: camera.shutterAngleMode,
             supportedRange: camera.capabilities.manualExposureRange

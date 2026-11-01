@@ -29,6 +29,11 @@ private enum EditorParameter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private enum GestureAxis {
+    case horizontal
+    case vertical
+}
+
 struct CameraColorEditorView: View {
     @EnvironmentObject private var colors: CameraColorStore
     @Environment(\.dismiss) private var dismiss
@@ -39,7 +44,8 @@ struct CameraColorEditorView: View {
     @State private var stage = EditorStage.process
     @State private var parameter = EditorParameter.clarity
     @State private var selectedBand = HSLBand.yellow
-    @State private var chooserVisible = true
+    @State private var parameterSelectionVisible = false
+    @State private var gestureAxis: GestureAxis?
     @State private var showAffectedColor = false
     @State private var before = false
     @State private var photoItem: PhotosPickerItem?
@@ -80,11 +86,6 @@ struct CameraColorEditorView: View {
                 .padding(.top, 10)
 
             HStack(spacing: 12) {
-                PhotosPicker(selection: $photoItem, matching: .images) {
-                    Label("Change Photo", systemImage: "photo")
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .glass(in: Capsule())
-                }
                 Button { before.toggle() } label: {
                     Label(before ? "Before" : "After", systemImage: "rectangle.lefthalf.inset.filled")
                         .frame(maxWidth: .infinity, minHeight: 44)
@@ -141,9 +142,18 @@ struct CameraColorEditorView: View {
                     .blendMode(.plusLighter)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
             }
-            if chooserVisible {
-                parameterChooser
+            if parameterSelectionVisible { parameterSelectionIndicator }
+
+            PhotosPicker(selection: $photoItem, matching: .images) {
+                Label(displayedImage == nil ? "Select Image" : "Change Image", systemImage: "photo.on.rectangle")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .padding(.horizontal, 14)
+                    .frame(height: 38)
+                    .glass(in: Capsule(), emphasized: true)
             }
+            .accessibilityIdentifier("cameraColors.imageSelector")
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            .padding(12)
         }
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.12), lineWidth: 0.7))
@@ -152,16 +162,11 @@ struct CameraColorEditorView: View {
         .gesture(editorGesture)
     }
 
-    private var parameterChooser: some View {
-        VStack(spacing: 4) {
-            ForEach(parameters, id: \.self) { item in
-                Text(item.rawValue)
-                    .font(.system(size: item == parameter ? 14 : 11, weight: item == parameter ? .bold : .medium, design: .rounded))
-                    .foregroundStyle(item == parameter ? InCamTheme.ivory : InCamTheme.ivory.opacity(0.45))
-                    .frame(height: item == parameter ? 28 : 20)
-            }
-        }
-        .padding(.horizontal, 18).padding(.vertical, 9)
+    private var parameterSelectionIndicator: some View {
+        Text(parameter.rawValue.uppercased())
+            .font(.system(size: 13, weight: .bold, design: .rounded))
+            .foregroundStyle(InCamTheme.ivory)
+            .padding(.horizontal, 16).padding(.vertical, 11)
         .glass(in: RoundedRectangle(cornerRadius: 18), emphasized: true)
         .transition(.opacity.combined(with: .scale(scale: 0.94)))
     }
@@ -169,24 +174,33 @@ struct CameraColorEditorView: View {
     private var editorGesture: some Gesture {
         DragGesture(minimumDistance: 5)
             .onChanged { value in
-                let horizontal = abs(value.translation.width) > abs(value.translation.height) + 7
-                if horizontal {
-                    if gestureStartAmount == nil { gestureStartAmount = amountBinding.wrappedValue }
-                    chooserVisible = false
+                if gestureAxis == nil,
+                   max(abs(value.translation.width), abs(value.translation.height)) > 8 {
+                    gestureAxis = abs(value.translation.width) > abs(value.translation.height)
+                        ? .horizontal : .vertical
+                    gestureStartAmount = amountBinding.wrappedValue
+                    gestureStartParameter = parameters.firstIndex(of: parameter) ?? 0
+                }
+                switch gestureAxis {
+                case .horizontal:
+                    parameterSelectionVisible = false
                     showAffectedColor = false
                     amountBinding.wrappedValue = min(amountRange.upperBound, max(amountRange.lowerBound,
                         (gestureStartAmount ?? 0) + Double(value.translation.width) * amountStep / 5))
-                } else {
-                    chooserVisible = true
+                case .vertical:
+                    parameterSelectionVisible = true
                     let index = max(0, min(parameters.count - 1,
-                        gestureStartParameter + Int((-value.translation.height / 34).rounded())))
+                        gestureStartParameter + Int((-value.translation.height / 42).rounded())))
                     parameter = parameters[index]
+                case nil:
+                    break
                 }
             }
             .onEnded { _ in
                 gestureStartAmount = nil
                 gestureStartParameter = parameters.firstIndex(of: parameter) ?? 0
-                withAnimation(.easeOut(duration: 0.15)) { chooserVisible = true }
+                gestureAxis = nil
+                withAnimation(.easeOut(duration: 0.16)) { parameterSelectionVisible = false }
             }
     }
 
@@ -217,7 +231,7 @@ struct CameraColorEditorView: View {
                 Button {
                     stage = item
                     parameter = parameters(for: item).first!
-                    chooserVisible = true
+                    parameterSelectionVisible = false
                 } label: {
                     Text(item.rawValue)
                         .font(.system(size: 12, weight: stage == item ? .bold : .medium, design: .rounded))

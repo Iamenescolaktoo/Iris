@@ -246,10 +246,12 @@ struct CameraDock: View {
             }), range: -7...7, step: 1) { String(format: "%+.0f", $0) }
         case .shutter:
             let options = shutterOptions
-            // The rail readout and this ruler intentionally use the live
-            // metered duration as their common source, including in Auto.
-            // This prevents 1/40 on the readout while the dial says 1/60.
-            let preferredSeconds = camera.exposureSeconds
+            // Angle is a selected presentation value, not a live meter.
+            // Keeping its anchor on the last deliberate shutter choice
+            // prevents the angle ruler from wandering as Auto meters a scene.
+            let preferredSeconds = camera.shutterAngleMode
+                ? camera.lastManualExposureSeconds
+                : camera.exposureSeconds
             let dialIndex = options.indices.min(by: { abs(options[$0] - preferredSeconds) < abs(options[$1] - preferredSeconds) }) ?? 0
             let dialSeconds = options[dialIndex]
             PrecisionRuler(value: Binding(get: {
