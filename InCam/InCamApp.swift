@@ -1,5 +1,9 @@
 import SwiftUI
 
+// FILE GUIDE: App entry point. It creates one shared instance of each long-
+// lived store and injects them into CameraScreen. Creating these objects is
+// lightweight; opening the physical camera begins from CameraScreen.onAppear.
+
 @main
 struct InCamApp: App {
     @UIApplicationDelegateAdaptor(InCamAppDelegate.self) private var appDelegate

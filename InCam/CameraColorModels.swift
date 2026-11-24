@@ -2,6 +2,10 @@ import CoreImage
 import Foundation
 import SwiftUI
 
+// FILE GUIDE: Persistent Custom Color recipe data and its Core Image reference
+// renderer. Recipes are currently for the editor/reference workflow; they are
+// not evidence of a live or recorded HSL-processing pipeline.
+
 struct HSLAdjustment: Codable, Equatable {
     var hue: Double = 0
     var saturation: Double = 0
@@ -45,6 +49,7 @@ struct CameraColorRecipe: Codable, Identifiable, Equatable {
     var grainSoftness: Double = 0.4
     var grainPattern = "Fine"
 
+    // Compares edit values while ignoring recipe identity/name so overwrite confirmation can be accurate.
     func hasSameAdjustments(as other: CameraColorRecipe) -> Bool {
         var lhs = self
         var rhs = other
@@ -97,6 +102,9 @@ final class CameraColorStore: ObservableObject {
     private let defaultsKey = "incam.camera-color-recipes.v1"
     private let quickSlotsKey = "incam.custom-colors.seven.v2"
     private let legacyQuickSlotsKey = "incam.custom-colors.five.v1"
+    // The prior experimental UI could write empty CC1...CC5 placeholders.
+    // Migrate those once, without ever clearing profiles saved by this dock.
+    private let placeholderMigrationKey = "incam.custom-colors.remove-placeholder-slots.v1"
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -107,7 +115,22 @@ final class CameraColorStore: ObservableObject {
             ?? defaults.data(forKey: legacyQuickSlotsKey)
             ?? Data()
         let savedQuick = (try? JSONDecoder().decode([CameraColorRecipe?].self, from: quickData)) ?? []
-        quickSlots = Array((savedQuick + Array(repeating: nil, count: 7)).prefix(7))
+        var normalizedQuick = Array((savedQuick + Array(repeating: nil, count: 7)).prefix(7))
+        if !defaults.bool(forKey: placeholderMigrationKey) {
+            // Only remove the old, neutral auto-generated names on this one
+            // migration. From this point forward every CC is device-persisted.
+            normalizedQuick = normalizedQuick.enumerated().map { index, recipe in
+                guard let recipe,
+                      recipe.name == "CC\(index + 1)",
+                      !recipe.hasVisibleAdjustments else { return recipe }
+                return nil
+            }
+            defaults.set(true, forKey: placeholderMigrationKey)
+            if let data = try? JSONEncoder().encode(normalizedQuick) {
+                defaults.set(data, forKey: quickSlotsKey)
+            }
+        }
+        quickSlots = normalizedQuick
         if let data = defaults.data(forKey: defaultsKey),
            let decoded = try? JSONDecoder().decode([CameraColorRecipe].self, from: data),
            !decoded.isEmpty {
@@ -130,6 +153,7 @@ final class CameraColorStore: ObservableObject {
         persist()
     }
 
+    // Writes a recipe into a specific Custom Color slot and persists the complete library.
     func save(_ recipe: CameraColorRecipe, to index: Int) {
         guard slots.indices.contains(index) else { return }
         var saved = recipe
@@ -139,6 +163,7 @@ final class CameraColorStore: ObservableObject {
         persist()
     }
 
+    // Saves a quick-slot recipe without asking the editor to create a new slot.
     func saveQuick(_ recipe: CameraColorRecipe, to index: Int) {
         guard quickSlots.indices.contains(index) else { return }
         quickSlots[index] = recipe
@@ -147,13 +172,26 @@ final class CameraColorStore: ObservableObject {
         }
     }
 
+    /// Removes a saved Custom Color profile without touching the separate
+    /// recipe library. The vacated quick slot becomes the next available CC.
+    func deleteQuick(at index: Int) {
+        guard quickSlots.indices.contains(index) else { return }
+        quickSlots[index] = nil
+        if selectedSlot == index { selectedSlot = nil }
+        if let data = try? JSONEncoder().encode(quickSlots) {
+            defaults.set(data, forKey: quickSlotsKey)
+        }
+    }
+
     @discardableResult
+    // Appends a new empty Custom Color slot and returns its index for selection.
     func addCustomColor() -> Int {
         slots.append(CameraColorRecipe(name: "Custom Color #\(slots.count + 1)"))
         persist()
         return slots.count - 1
     }
 
+    // Applies a short display name to an existing recipe slot and saves it.
     func rename(at index: Int, to name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard slots.indices.contains(index), !trimmed.isEmpty else { return }
@@ -161,6 +199,7 @@ final class CameraColorStore: ObservableObject {
         persist()
     }
 
+    // Serializes the recipe library to UserDefaults; this is small metadata, not rendered video.
     private func persist() {
         if let data = try? JSONEncoder().encode(slots) { defaults.set(data, forKey: defaultsKey) }
     }
@@ -176,6 +215,7 @@ enum RecipeRenderer {
     private static let cubeLock = NSLock()
     private static var cubeCache: [Data: Data] = [:]
 
+    // Applies an InCam recipe to a reference CIImage for editor preview/export composition.
     static func render(_ image: CIImage, recipe: CameraColorRecipe) -> CIImage {
         var output = image
         // White-balance Tint belongs to AVCaptureDevice, not the recipe
@@ -188,10 +228,14 @@ enum RecipeRenderer {
         // Fuji-style clarity is deliberately bounded in ColorDockControls.
         // Positive values add restrained luminance detail; negative values
         // gently soften without creating the old extreme color shifts.
+        // Threshold gates fine-detail enhancement. At zero, both detail
+        // controls work at their selected strength; moving Threshold upward
+        // progressively protects low-contrast texture from enhancement.
+        let detailGate = max(0, 1 - min(1, recipe.threshold) * 0.7)
         if recipe.clarity > 0.0001 {
             output = output.applyingFilter("CIUnsharpMask", parameters: [
                 kCIInputRadiusKey: 1.25,
-                kCIInputIntensityKey: recipe.clarity * 0.65,
+                kCIInputIntensityKey: recipe.clarity * 0.85 * detailGate,
             ])
         } else if recipe.clarity < -0.0001 {
             let softened = output.applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: abs(recipe.clarity) * 1.5])
@@ -208,7 +252,7 @@ enum RecipeRenderer {
         }
         if recipe.sharpening > 0 {
             output = output.applyingFilter("CISharpenLuminance", parameters: [
-                kCIInputSharpnessKey: recipe.sharpening * 1.5,
+                kCIInputSharpnessKey: recipe.sharpening * 1.8 * detailGate,
             ])
         }
         // Film look is last.
@@ -232,9 +276,38 @@ enum RecipeRenderer {
         return output.cropped(to: image.extent)
     }
 
+    /// A temporary HSL inspection pass used only by the editor. It leaves the
+    /// chosen hue family in color and removes unrelated hues, making it clear
+    /// what the next HSL adjustment will affect. It is never saved or applied
+    /// to preview/recording output.
+    // Produces the temporary selected-color visualization used while editing one HSL range.
+    static func isolate(_ image: CIImage, band: HSLBand, range: Double, falloff: Double) -> CIImage {
+        let dimension = 16
+        var values = [Float]()
+        values.reserveCapacity(dimension * dimension * dimension * 4)
+        let adjustment = HSLAdjustment(range: range, falloff: falloff)
+        for blue in 0..<dimension {
+            for green in 0..<dimension {
+                for red in 0..<dimension {
+                    let rgb = (Double(red) / Double(dimension - 1),
+                               Double(green) / Double(dimension - 1),
+                               Double(blue) / Double(dimension - 1))
+                    let weight = bandWeight(hue: rgbToHSL(rgb).0, band: band, adjustment: adjustment)
+                    let muted = (rgb.0 * weight, rgb.1 * weight, rgb.2 * weight)
+                    values += [Float(muted.0), Float(muted.1), Float(muted.2), 1]
+                }
+            }
+        }
+        return image.applyingFilter("CIColorCube", parameters: [
+            "inputCubeDimension": dimension,
+            "inputCubeData": values.withUnsafeBufferPointer { Data(buffer: $0) },
+        ]).cropped(to: image.extent)
+    }
+
     /// Builds a small GPU lookup table for selective HSL. Core Image evaluates
     /// the table on the preview/export GPU, while this conversion runs only when
     /// a recipe changes (not once for every video pixel or frame).
+    // Builds or retrieves a cached Core Image color cube for the recipe's HSL adjustments.
     private static func colorCube(for recipe: CameraColorRecipe) -> Data {
         let key = (try? JSONEncoder().encode(recipe)) ?? Data()
         cubeLock.lock()
@@ -263,6 +336,7 @@ enum RecipeRenderer {
         return data
     }
 
+    // Converts one RGB sample through every active HSL band when generating the color cube.
     private static func applyHSL(to rgb: (Double, Double, Double), recipe: CameraColorRecipe) -> (Double, Double, Double) {
         var hsl = rgbToHSL(rgb)
         let originalHue = hsl.0
@@ -278,6 +352,7 @@ enum RecipeRenderer {
         return hslToRGB(hsl)
     }
 
+    // Calculates the soft circular hue-range weight that prevents abrupt HSL color boundaries.
     private static func bandWeight(hue: Double, band: HSLBand, adjustment: HSLAdjustment) -> Double {
         let centers: [HSLBand: Double] = [.red: 0, .orange: 30, .yellow: 60, .green: 120,
                                            .aqua: 180, .blue: 240, .purple: 270, .magenta: 320]
@@ -290,6 +365,7 @@ enum RecipeRenderer {
         return pow(edge, 1 / falloff)
     }
 
+    // Converts normalized RGB into hue, saturation and luminance for recipe processing.
     private static func rgbToHSL(_ rgb: (Double, Double, Double)) -> (Double, Double, Double) {
         let maxValue = max(rgb.0, rgb.1, rgb.2)
         let minValue = min(rgb.0, rgb.1, rgb.2)
@@ -306,6 +382,7 @@ enum RecipeRenderer {
         return (hue, saturation, lightness)
     }
 
+    // Converts adjusted hue, saturation and luminance back into normalized RGB.
     private static func hslToRGB(_ hsl: (Double, Double, Double)) -> (Double, Double, Double) {
         guard hsl.1 > 0.000001 else { return (hsl.2, hsl.2, hsl.2) }
         let c = (1 - abs(2 * hsl.2 - 1)) * hsl.1

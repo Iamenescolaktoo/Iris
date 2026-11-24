@@ -1,5 +1,9 @@
 import SwiftUI
 
+// FILE GUIDE: On-camera adjustment controls (focus, WB, shutter, ISO, etc.).
+// This file draws and routes the controls; CameraController applies changes to
+// the physical device on its dedicated camera queue.
+
 struct FocusControls: View {
     @EnvironmentObject private var camera: CameraController
     var vertical = false
@@ -245,23 +249,28 @@ struct CameraDock: View {
                 camera.setTint(Float($0 * 12))
             }), range: -7...7, step: 1) { String(format: "%+.0f", $0) }
         case .shutter:
-            let options = shutterOptions
-            // Angle is a selected presentation value, not a live meter.
-            // Keeping its anchor on the last deliberate shutter choice
-            // prevents the angle ruler from wandering as Auto meters a scene.
-            let preferredSeconds = camera.shutterAngleMode
-                ? camera.lastManualExposureSeconds
-                : camera.exposureSeconds
-            let dialIndex = options.indices.min(by: { abs(options[$0] - preferredSeconds) < abs(options[$1] - preferredSeconds) }) ?? 0
-            let dialSeconds = options[dialIndex]
-            PrecisionRuler(value: Binding(get: {
-                Double(dialIndex)
-            }, set: {
-                camera.setExposure(options[min(options.count - 1, max(0, Int($0.rounded())))])
-            }), range: 0...Double(options.count - 1), step: 1) { _ in
-                camera.shutterAngleMode
-                    ? String(format: "%.1f°", min(360, dialSeconds * Double(camera.frameRate) * 360))
-                    : Self.shutterLabel(dialSeconds)
+            if camera.shutterAngleMode {
+                let options = shutterAngleOptions
+                let dialIndex = options.indices.min(by: {
+                    abs(options[$0] - camera.shutterAngleDegrees) < abs(options[$1] - camera.shutterAngleDegrees)
+                }) ?? 0
+                PrecisionRuler(value: Binding(get: {
+                    Double(dialIndex)
+                }, set: {
+                    camera.setShutterAngle(options[min(options.count - 1, max(0, Int($0.rounded())))])
+                }), range: 0...Double(options.count - 1), step: 1) { index in
+                    CameraExposureDefaults.shutterAngleLabel(options[min(options.count - 1, max(0, Int(index.rounded())))])
+                }
+            } else {
+                let options = shutterOptions
+                let dialIndex = options.indices.min(by: { abs(options[$0] - camera.exposureSeconds) < abs(options[$1] - camera.exposureSeconds) }) ?? 0
+                PrecisionRuler(value: Binding(get: {
+                    Double(dialIndex)
+                }, set: {
+                    camera.setExposure(options[min(options.count - 1, max(0, Int($0.rounded())))])
+                }), range: 0...Double(options.count - 1), step: 1) { index in
+                    Self.shutterLabel(options[min(options.count - 1, max(0, Int(index.rounded())))])
+                }
             }
         case .iso:
             let options = isoOptions
@@ -297,13 +306,19 @@ struct CameraDock: View {
 
     private var shutterOptions: [Double] {
         let range = camera.capabilities.manualExposureRange
-        let fps = Double(max(1, camera.frameRate))
-        let candidates: [Double] = camera.shutterAngleMode
-            ? CameraExposureDefaults.shutterAngleDegrees.map { $0 / (fps * 360) }
-            : CameraExposureDefaults.shutterSeconds
-        let available = candidates.filter { $0 >= range.lowerBound - 0.0000001 && $0 <= range.upperBound + 0.0000001 }
+        let available = CameraExposureDefaults.shutterSeconds.filter { $0 >= range.lowerBound - 0.0000001 && $0 <= range.upperBound + 0.0000001 }
         // Unusual hardware formats may support none of the usual presets.
         return available.isEmpty ? [range.lowerBound] : available
+    }
+
+    private var shutterAngleOptions: [Double] {
+        let range = camera.capabilities.manualExposureRange
+        let fps = Double(max(1, camera.frameRate))
+        let available = CameraExposureDefaults.shutterAngleDegrees.filter {
+            let duration = $0 / (fps * 360)
+            return duration >= range.lowerBound - 0.0000001 && duration <= range.upperBound + 0.0000001
+        }
+        return available.isEmpty ? [CameraExposureDefaults.closestShutterAngle(camera.shutterAngleDegrees)] : available
     }
 
     /// Exact ISO stops requested for the camera UI. This is intentionally a

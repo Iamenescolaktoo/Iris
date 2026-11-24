@@ -3,6 +3,10 @@ import AVKit
 import SwiftUI
 import UIKit
 
+// FILE GUIDE: Settings pages, category tiles and inspection controls. It reads
+// and writes shared models; AVFoundation operations remain in CameraController
+// so a Settings tap does not configure hardware directly on the main thread.
+
 struct AudioInputOption: Identifiable, Equatable {
     let id: String
     let name: String
@@ -14,6 +18,9 @@ struct AudioLevelMeters: View {
     var height: CGFloat = 100
     var showsChannelLabels = true
     var orientation: Orientation = .vertical
+    var showsTrackBackground = true
+    var trackOpacity: CGFloat = 0.12
+    var usesNeutralMeterColor = false
     var body: some View {
         Group {
         if orientation == .vertical {
@@ -24,10 +31,11 @@ struct AudioLevelMeters: View {
                 VStack(spacing: 5) {
                     GeometryReader { geometry in
                         ZStack(alignment: .bottom) {
-                            Capsule().fill(.white.opacity(0.12))
+                            if showsTrackBackground {
+                                Capsule().fill(.white.opacity(trackOpacity))
+                            }
                             if let level {
-                                Capsule().fill(LinearGradient(colors: [.green, .yellow, .red],
-                                                               startPoint: .bottom, endPoint: .top))
+                                Capsule().fill(meterFill)
                                     .frame(height: geometry.size.height * CGFloat((min(0, max(-60, level)) + 60) / 60))
                             }
                         }
@@ -52,10 +60,11 @@ struct AudioLevelMeters: View {
                         }
                         GeometryReader { geometry in
                             ZStack(alignment: .leading) {
-                                Capsule().fill(.white.opacity(0.12))
+                                if showsTrackBackground {
+                                    Capsule().fill(.white.opacity(trackOpacity))
+                                }
                                 if let level {
-                                    Capsule().fill(LinearGradient(colors: [.green, .yellow, .red],
-                                                                   startPoint: .leading, endPoint: .trailing))
+                                    Capsule().fill(meterFill)
                                         .frame(width: geometry.size.width * CGFloat((min(0, max(-60, level)) + 60) / 60))
                                 }
                             }
@@ -75,6 +84,18 @@ struct AudioLevelMeters: View {
     private var displayedTracks: [Float?] {
         [levels.indices.contains(0) ? levels[0] : nil,
          levels.indices.contains(1) ? levels[1] : nil]
+    }
+
+    // Type-erasing the style keeps this widely reused view inexpensive for
+    // Swift's type checker while letting the compact launcher use neutral bars.
+    private var meterFill: AnyShapeStyle {
+        if usesNeutralMeterColor {
+            return AnyShapeStyle(.white.opacity(0.86))
+        }
+        let start: UnitPoint = orientation == .vertical ? .bottom : .leading
+        let end: UnitPoint = orientation == .vertical ? .top : .trailing
+        return AnyShapeStyle(LinearGradient(colors: [.green, .yellow, .red],
+                                            startPoint: start, endPoint: end))
     }
 }
 
@@ -173,8 +194,9 @@ private struct AudioDeviceDragSelector: View {
     }
 }
 
-/// A private in-app gallery. It displays only copies created by InCam and
-/// never asks to browse the user's existing Photos library.
+/// PAUSED FEATURE: A private in-app gallery. It displays only copies created
+/// by InCam and never asks to browse the user's existing Photos library. Its
+/// camera entry points are disabled by `AppFeatureAvailability.gallery`.
 struct SavedMediaGallery: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = SavedMediaGalleryModel()
@@ -618,6 +640,13 @@ struct SettingsView: View {
     /// means a back action from any submenu returns to the same swipe page.
     @State private var category: SettingsCategory?
     @State private var settingsHomePage = 0
+    private let onDismiss: (() -> Void)?
+    private let backdropOpacity: Double
+
+    init(onDismiss: (() -> Void)? = nil, backdropOpacity: Double = 1) {
+        self.onDismiss = onDismiss
+        self.backdropOpacity = min(1, max(0, backdropOpacity))
+    }
 
     var body: some View {
         NavigationStack {
@@ -628,7 +657,7 @@ struct SettingsView: View {
                     settingsHome
                 }
             }
-            .background(InCamTheme.graphite)
+            .background(InCamTheme.graphite.opacity(backdropOpacity))
             .tint(InCamTheme.ivory)
         }
     }
@@ -636,56 +665,89 @@ struct SettingsView: View {
     /// The V1.4 home is deliberately just the requested paged 3 × 2 grid.
     /// Descriptions belong to detail pages, not to the category tiles.
     private var settingsHome: some View {
-        TabView(selection: $settingsHomePage) {
-            settingsHomePageGrid(SettingsCategory.firstPage)
-                .tag(0)
-            settingsHomePageGrid(SettingsCategory.secondPage)
-                .tag(1)
-        }
-        .tabViewStyle(.page(indexDisplayMode: .always))
-        .indexViewStyle(.page(backgroundDisplayMode: .always))
-        .toolbar(.hidden, for: .navigationBar)
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 24)
-                .onEnded { value in
-                    // A deliberate upward swipe closes the sheet; horizontal
-                    // drags remain owned by the paged category navigation.
-                    guard abs(value.translation.height) > abs(value.translation.width),
-                          value.translation.height < -60 else { return }
-                    dismiss()
+        VStack(spacing: 0) {
+            TabView(selection: $settingsHomePage) {
+                settingsHomePageGrid(SettingsCategory.firstPage)
+                    .tag(0)
+                settingsHomePageGrid(SettingsCategory.secondPage)
+                    .tag(1)
+            }
+            // The built-in page indicator overlays its page content. Keeping
+            // a dedicated footer gives these dots a real layout reservation,
+            // so they can never collide with the lower tile row.
+            .tabViewStyle(.page(indexDisplayMode: .never))
+
+            HStack(spacing: 12) {
+                ForEach(0..<2, id: \.self) { page in
+                    Circle()
+                        .fill(page == settingsHomePage ? InCamTheme.ivory : InCamTheme.ivory.opacity(0.28))
+                        .frame(width: 8, height: 8)
+                        .accessibilityHidden(true)
                 }
-        )
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 32)
+            .background(.white.opacity(0.06), in: Capsule())
+            .padding(.bottom, 16)
+        }
+        .toolbar(.hidden, for: .navigationBar)
         .accessibilityIdentifier("settings.home")
     }
 
-    private func settingsHomePageGrid(_ categories: [SettingsCategory]) -> some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
-            ForEach(categories) { category in
-                Button { self.category = category } label: {
-                    VStack(spacing: 9) {
-                        Image(systemName: category.icon)
-                            .font(.system(size: 23, weight: .medium))
-                            .frame(height: 26)
-                        Text(category.rawValue)
-                            .font(.system(size: 14, weight: .semibold, design: .rounded))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                    }
-                    .foregroundStyle(InCamTheme.ivory)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 106)
-                    .background(Color(red: 0.15, green: 0.17, blue: 0.20), in: RoundedRectangle(cornerRadius: 19, style: .continuous))
-                }
-                .buttonStyle(PressScaleStyle())
-                .accessibilityLabel("Open \(category.rawValue) settings")
-                .accessibilityIdentifier("settings.category.\(category.id)")
-            }
+    private func closeSettings() {
+        if let onDismiss {
+            onDismiss()
+        } else {
+            dismiss()
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 34)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func settingsHomePageGrid(_ categories: [SettingsCategory]) -> some View {
+        GeometryReader { proxy in
+            // DJI-like landscape tiles: the grid always preserves a 4:3
+            // tile, then scales down only as much as the current display
+            // height requires so both rows and page dots remain visible.
+            let horizontalPadding: CGFloat = 16
+            let spacing: CGFloat = 12
+            let widthLimitedTile = max(1, (proxy.size.width - horizontalPadding * 2 - spacing * 2) / 3)
+            let heightLimitedTile = max(1, (proxy.size.height - 36 - spacing) / 2 * 4 / 3)
+            let tileWidth = min(widthLimitedTile, heightLimitedTile)
+            let tileHeight = tileWidth * 3 / 4
+            ZStack {
+                // Settings is full-screen, so blank charcoal around the tiles
+                // is the dismiss target. This leaves system upward gestures
+                // alone and keeps the page swipe owned by the TabView.
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: closeSettings)
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(tileWidth), spacing: spacing), count: 3), spacing: spacing) {
+                    ForEach(categories) { category in
+                        Button { self.category = category } label: {
+                            VStack(spacing: 9) {
+                                Image(systemName: category.icon)
+                                    .font(.system(size: min(23, tileHeight * 0.22), weight: .medium))
+                                    .frame(height: min(26, tileHeight * 0.25))
+                                Text(category.rawValue)
+                                    .font(.system(size: min(14, tileHeight * 0.15), weight: .semibold, design: .rounded))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.72)
+                            }
+                            .foregroundStyle(InCamTheme.ivory)
+                            .frame(width: tileWidth, height: tileHeight)
+                            .background(Color(red: 0.15, green: 0.17, blue: 0.20), in: RoundedRectangle(cornerRadius: min(19, tileHeight * 0.18), style: .continuous))
+                        }
+                        // Tiles are stable; opening and closing Settings uses
+                        // the parent screen's short opacity transition.
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Open \(category.rawValue) settings")
+                        .accessibilityIdentifier("settings.category.\(category.id)")
+                    }
+                }
+            }
+            // The available geometry changes with every phone, split view,
+            // and rotation. Centering inside it avoids a fixed top offset.
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .center)
+        }
     }
 
     @ViewBuilder
@@ -729,9 +791,9 @@ struct SettingsView: View {
         }
         if favoriteZoom { zoomSection }
         if favoriteComposition { compositionSection }
-        if favoriteLooks {
+        if favoriteLooks && AppFeatureAvailability.cameraColorsEditor {
             Section("Camera Colors") {
-                NavigationLink { CameraColorLibraryView() } label: { settingsLabel("Camera Colors", "camera.filters") }
+                NavigationLink { CameraColorSourceView() } label: { settingsLabel("Camera Colors", "camera.filters") }
             }
         }
         if favoriteScreen { screenSection }
@@ -793,6 +855,12 @@ struct SettingsView: View {
 
     @ViewBuilder private var photoSettings: some View {
         Section("Photo capture") {
+            Toggle("Mirror front preview", isOn: Binding(
+                get: { camera.frontPreviewMirrored },
+                set: { camera.setFrontPreviewMirrored($0) }
+            ))
+            Text("Changes only the live front-camera view so left and right movement tracks naturally. Saved photos and video remain unmirrored.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Enable Photo mode", isOn: $photoEnabled)
                 .disabled(camera.isRecording)
                 .accessibilityIdentifier("settings.photoEnabled")
@@ -844,12 +912,21 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var colorSettings: some View {
-        Section("Camera Color") {
-            NavigationLink { CameraColorLibraryView() } label: {
-                settingsLabel("Camera Color Studio", "camera.filters")
+        if AppFeatureAvailability.cameraColorsEditor {
+            Section("Camera Color") {
+                NavigationLink { CameraColorSourceView() } label: {
+                    settingsLabel("Camera Color Studio", "camera.filters")
+                }
+                Text("Color Styles are edited here. The viewfinder only selects None or assigned C1–C9 profiles.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
-            Text("Color Styles are edited here. The viewfinder only selects None or assigned C1–C9 profiles.")
+        } else {
+            Section("Camera Color") {
+                Label("Camera Color Studio is temporarily off", systemImage: "pause.circle")
+                    .foregroundStyle(.secondary)
+                Text("Saved recipe data remains preserved while this editor is redesigned.")
                 .font(.footnote).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -922,8 +999,6 @@ struct SettingsView: View {
 
     private var compositionSection: some View {
         Section {
-            Toggle("Save output in selected ratio", isOn: $preferences.saveFramedOutput)
-                .disabled(camera.isRecording)
             ForEach(CompositionRatio.catalog + preferences.ratioShortcuts.filter { !CompositionRatio.catalog.contains($0) }) { ratio in
                 let selected = preferences.ratioShortcuts.contains(ratio)
                 Button { preferences.toggleRatio(ratio) } label: {
@@ -939,9 +1014,7 @@ struct SettingsView: View {
         } header: {
             Text("Ratios")
         } footer: {
-            Text(preferences.saveFramedOutput
-                 ? "InCam center-crops saved photos and exports completed videos to the selected ratio. Changing the guide while recording does not alter the clip already in progress."
-                 : "Ratios and grids are composition guides. Turn on Save output in selected ratio to crop saved photos and videos.")
+            Text("InCam center-crops saved photos and completed video exports to the selected ratio. The ratio is frozen when recording starts, so changing the guide later cannot reshape an existing clip.")
         }
     }
 
@@ -1046,7 +1119,12 @@ struct CameraColorLibraryView: View {
     @EnvironmentObject private var colors: CameraColorStore
 
     var body: some View {
-        List {
+        Group {
+            if !AppFeatureAvailability.cameraColorsEditor {
+                ContentUnavailableView("Camera Colors is off", systemImage: "pause.circle",
+                                       description: Text("Saved recipe data remains available for the redesign."))
+            } else {
+                List {
             ForEach(Array(colors.slots.enumerated()), id: \.element.id) { index, recipe in
                 NavigationLink {
                     CameraColorEditorView(recipe: recipe, sourceSlot: index)
@@ -1069,9 +1147,11 @@ struct CameraColorLibraryView: View {
                 Label("Create Camera Color", systemImage: "plus")
             }
             Section {
-                Text("Camera Colors appear in the live preview and are applied to saved photos and videos. Videos finish rendering after you stop recording; their original audio is kept. RAW capture is not offered by this app.")
+                Text("Saved profiles contain Camera Color recipe data. Use a reference image to create and compare a profile; rendering availability depends on the active Camera Colors pipeline. RAW capture is not offered by this app.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+                }
             }
         }
         .navigationTitle("Camera Colors")

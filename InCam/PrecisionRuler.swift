@@ -1,5 +1,9 @@
 import SwiftUI
 
+// FILE GUIDE: Reusable horizontal/vertical numeric ruler used by camera dials.
+// It translates a drag into bounded, stepped values; callers decide what a
+// value means and whether it changes UI-only or physical camera state.
+
 private struct VerticalCameraRulerKey: EnvironmentKey { static let defaultValue = false }
 private struct CameraRulerHeightKey: EnvironmentKey { static let defaultValue: CGFloat? = nil }
 extension EnvironmentValues {

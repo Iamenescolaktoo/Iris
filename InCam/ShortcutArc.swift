@@ -1,5 +1,9 @@
 import SwiftUI
 
+// FILE GUIDE: Draws the expandable radial shortcut menu around thumb controls.
+// It is a presentation/selection layer; CameraScreen decides the selected
+// shortcut's actual camera action.
+
 enum ShortcutSide: Hashable {
     case leading
     case trailing

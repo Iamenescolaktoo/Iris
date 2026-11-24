@@ -1,6 +1,9 @@
 import SwiftUI
 import UIKit
 
+// FILE GUIDE: Maintains allowed landscape orientation, current interface
+// orientation and safe-area data so camera controls can be placed reliably.
+
 enum CameraOrientationLock: String, CaseIterable, Identifiable {
     case unlocked = "Unlocked"
     case portrait = "Portrait"
@@ -36,6 +39,7 @@ final class CameraOrientation: ObservableObject {
     var supportedOrientations: UIInterfaceOrientationMask { recordingMask ?? selection.mask }
     var rotationAngle: CGFloat { interfaceOrientation.cameraRotationAngle }
 
+    // Stores the active window scene so orientation and safe-area data can be read consistently.
     func attach(_ scene: UIWindowScene) {
         let changed = self.scene !== scene
         self.scene = scene
@@ -43,6 +47,7 @@ final class CameraOrientation: ObservableObject {
         if changed { requestOrientation() }
     }
 
+    // Persists a requested orientation lock and asks UIKit to update it when legal.
     func select(_ value: CameraOrientationLock) {
         guard recordingMask == nil else { return }
         selection = value == .portrait ? .landscapeRight : value
@@ -51,11 +56,13 @@ final class CameraOrientation: ObservableObject {
     }
 
     // Even in Unlocked mode, don't rotate the UI/capture partway through a clip.
+    // Preserves the current orientation mask while recording so output does not rotate mid-take.
     func setRecording(_ recording: Bool) {
         recordingMask = recording ? interfaceOrientation.orientationMask : nil
         requestOrientation()
     }
 
+    // Publishes the window's current orientation and safe-area measurements for SwiftUI layout.
     func updateFromScene() {
         if let insets = scene?.windows.first(where: \.isKeyWindow)?.safeAreaInsets,
            insets != windowSafeAreaInsets { windowSafeAreaInsets = insets }
@@ -64,6 +71,7 @@ final class CameraOrientation: ObservableObject {
         interfaceOrientation = orientation
     }
 
+    // Sends the chosen allowed-orientation mask to UIKit's geometry update API.
     private func requestOrientation() {
         guard let scene else { return }
         for window in scene.windows {
@@ -98,6 +106,7 @@ extension UIInterfaceOrientation {
 }
 
 final class InCamAppDelegate: NSObject, UIApplicationDelegate {
+    // Supplies the app delegate's current orientation policy to UIKit.
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         CameraOrientation.shared.supportedOrientations
     }
@@ -105,12 +114,17 @@ final class InCamAppDelegate: NSObject, UIApplicationDelegate {
 
 /// Reads the actual window orientation, not the phone's transient motion data.
 struct CameraOrientationReader: UIViewRepresentable {
+    // Creates a transparent UIKit view that reports window orientation back to the shared store.
     func makeUIView(context: Context) -> OrientationHostView { OrientationHostView() }
+    // Requests a fresh orientation report during SwiftUI view updates.
     func updateUIView(_ uiView: OrientationHostView, context: Context) { uiView.report() }
 
     final class OrientationHostView: UIView {
+        // Reports orientation when this host joins a UIKit window.
         override func didMoveToWindow() { super.didMoveToWindow(); report() }
+        // Reports orientation after UIKit layout changes such as device rotation.
         override func layoutSubviews() { super.layoutSubviews(); report() }
+        // Sends the current host window to CameraOrientation on the main actor.
         func report() {
             guard let scene = window?.windowScene else { return }
             DispatchQueue.main.async { CameraOrientation.shared.attach(scene) }

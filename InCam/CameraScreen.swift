@@ -1,6 +1,11 @@
 import AVFoundation
 import AVKit
 import SwiftUI
+import UIKit
+
+// FILE GUIDE: The main camera composition. It positions preview, overlays,
+// thumb controls, dock, Settings and Gallery, then translates gestures into
+// CameraController commands. It owns presentation state, not AVFoundation.
 
 struct CameraScreen: View {
     @EnvironmentObject private var camera: CameraController
@@ -16,6 +21,7 @@ struct CameraScreen: View {
     @AppStorage("incam.composition.grid.last-mode") private var savedLastGridMode = GridMode.thirds.rawValue
     @AppStorage("incam.composition.grid.density") private var savedGridDensity = 3
     @AppStorage("incam.composition.level.enabled") private var levelEnabled = false
+    @AppStorage("incam.monitor.scope.mode") private var savedSceneScopeMode = SceneScopeMode.off.rawValue
 
     private var ratio: CompositionRatio { preferences.selectedRatio }
     @State private var grid = GridMode.off
@@ -30,6 +36,15 @@ struct CameraScreen: View {
     @State private var showRatioChoices = false
     @State private var showGridChoices = false
     @State private var showFormatChoices = false
+    @State private var showScopeChoices = false
+    /// The monitor may momentarily grow, without changing its analyser mode.
+    @State private var sceneScopeExpanded = false
+    /// A left swipe from the monitor folds it into a small circular launcher;
+    /// it does not turn the analyser off or discard the selected scope mode.
+    @State private var sceneScopeCollapsed = false
+    @State private var previewZoomOrigin: CGFloat?
+    @State private var previewZoomRulerVisible = false
+    @State private var previewZoomDismissWorkItem: DispatchWorkItem?
     @State private var focusTarget: CGPoint?
     @State private var focusTargetDismissWorkItem: DispatchWorkItem?
     @State private var focusInspector = false
@@ -37,76 +52,106 @@ struct CameraScreen: View {
     @State private var exposureInspector = false
     @State private var exposureTarget = CGPoint(x: 0.5, y: 0.5)
     @State private var exposureTargetPulse: CGFloat = 1
+    @State private var exposureTargetDragStartBias: Float?
+    @State private var exposureTargetLastStep = 0
     @State private var colorDockExpanded = false
+    @State private var cameraColorProfilesOpen = false
+    @State private var cameraColorEditorOpen = false
+    @State private var cameraColorEditorSlot: Int?
+    @State private var colorWheelExpanded = false
+    /// The image-based Color workspace is a separate full-screen task. It
+    /// never attaches the optional live camera color renderer while open.
+    @State private var colorWorkspaceOpen = false
     @StateObject private var colorControls = ColorDockControls()
     @State private var showGallery = false
     @State private var openShortcutSide: ShortcutSide?
     @State private var shortcutAdjustment: ShortcutAdjustment?
 
     private var adjustmentExpanded: Bool { expandedDock != nil }
+    /// A scope is bright while active and fades back after an outside tap.
+    @State private var sceneScopeFocused = false
+    /// The scope picker appears at the last held point, so its selected middle
+    /// row is exactly under the user's thumb instead of at a fixed corner.
+    @State private var sceneScopeMenuLocation: CGPoint?
+
+    /// The scope choice is persisted as a small preference, while the costly
+    /// frame analyser is controlled separately by CameraController.
+    private var sceneScopeMode: SceneScopeMode {
+        SceneScopeMode(rawValue: savedSceneScopeMode) ?? .off
+    }
+
+    /// New profiles always target the first empty visible CC slot. The saved
+    /// recipe itself is written only by the editor's explicit Save action.
+    private var nextCustomColorSlot: Int? {
+        Array(colors.quickSlots.indices.prefix(5)).first(where: { colors.quickSlots[$0] == nil })
+    }
 
     var body: some View {
         GeometryReader { proxy in
             let portrait = proxy.size.height > proxy.size.width
-            let colorDockHeight: CGFloat = portrait ? 0 : 44
             // Fixed width: an open tool must never push the live camera into
             // the charcoal control rectangle or move that rectangle itself.
             // This width is deliberately constant. Gallery, Record, and
             // Settings share its one vertical control column; the live camera
             // image must never move into this charcoal surface.
-            let rightControls: CGFloat = 196
+            /// The visible right-hand mousepad is exactly 160 points wide.
+            let rightControls: CGFloat = 160
+            let leadingNotch: CGFloat = portrait ? 0 : 39
             let previewFrame = PreviewLayout.frame(in: proxy.size, ratio: ratio, portrait: portrait,
                                                   safeLeft: orientation.windowSafeAreaInsets.left,
                                                   safeRight: orientation.windowSafeAreaInsets.right,
-                                                  adjustmentExpanded: adjustmentExpanded, rightControls: rightControls)
+                                                  adjustmentExpanded: adjustmentExpanded, rightControls: rightControls,
+                                                  leadingNotch: leadingNotch)
             // Reserve outside margins for the statistics/dial and capture controls.
             let leftInset = max(12, orientation.windowSafeAreaInsets.left)
             // The color dock belongs to the live camera rectangle, not to the
             // full phone. The remaining trailing width is for thumb controls.
-            let cameraRight = max(1, proxy.size.width - rightControls)
-            let captureCenter = CGPoint(x: cameraRight + rightControls / 2, y: proxy.size.height / 2)
-            // Recording feedback uses the selected composition frame. With
-            // framing removed, it traces the actual device container instead
-            // of inventing a generic rectangle in the middle of the screen.
-            let cameraViewport = CGRect(x: 0, y: 0, width: cameraRight, height: proxy.size.height)
-            let recordingRatioAspect = portrait ? 1 / ratio.value : ratio.value
-            let recordingRatioWidth = min(cameraViewport.width, cameraViewport.height * recordingRatioAspect)
-            let recordingRatioFrame = CGRect(
-                x: cameraViewport.midX - recordingRatioWidth / 2,
-                y: cameraViewport.midY - recordingRatioWidth / recordingRatioAspect / 2,
-                width: recordingRatioWidth,
-                height: recordingRatioWidth / recordingRatioAspect
-            )
-            // The dock and left composition-tool stack follow the selected
-            // guide, not the physical phone center. A narrower 4:3 or 1:1
-            // guide therefore carries its own controls inward with it.
-            let activeGuideFrame = preferences.framingGuide ? recordingRatioFrame : cameraViewport
-            // A rounded rectangle rather than a capsule, deliberately 13%
-            // shorter than the available guide. Its width is recalculated
-            // whenever the selected aspect ratio changes.
-            let dockWidth = min(520, activeGuideFrame.width * 0.72)
+            /// The viewfinder stops before both the black notch and mousepad.
+            /// `PreviewLayout` owns the same geometry used by the guides.
+            let cameraWidth = previewFrame.width
+            let controlSurfaceFrame = CGRect(x: proxy.size.width - rightControls, y: 0,
+                                             width: rightControls, height: proxy.size.height)
+            let controlSurfaceLeading = controlSurfaceFrame.minX
+            /// + / Record / − are centered on this exact 160-point mousepad.
+            let captureCenter = CGPoint(x: controlSurfaceFrame.midX, y: controlSurfaceFrame.midY)
+            /// Matching circles at the top/bottom of the thumb rail use a
+            /// slightly smaller vertical inset, leaving more breathing room
+            /// around the centered Record column.
+            let railAccessoryDiameter: CGFloat = 41
+            let railEdgePadding = (rightControls - railAccessoryDiameter) / 2
+            let railVerticalEdgePadding = railEdgePadding * 0.75
+            let flipAccessoryY = railVerticalEdgePadding + railAccessoryDiameter / 2
+            let colorAccessoryY = proxy.size.height - railVerticalEdgePadding - railAccessoryDiameter / 2
             // 16:9 is shown as a true edge-to-edge preview crop: the camera
             // image fills the whole rounded viewport, with no blurred guide
             // bands or leftover edges. This changes preview only, not output.
-            let viewportAspect = cameraRight / max(1, proxy.size.height)
+            let viewportAspect = cameraWidth / max(1, proxy.size.height)
             let ratioPreviewZoom: CGFloat = !portrait && ratio == .sixteenNine
                 ? max(1, ratio.value / viewportAspect) : 1
             ZStack {
-                // Outside the live camera viewport: a muted, dock-like control surface.
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay {
-                        LinearGradient(colors: [.white.opacity(0.20), .white.opacity(0.06), InCamTheme.graphite.opacity(0.38), .black.opacity(0.16)],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing)
-                            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-                    }
-                    .frame(width: max(0, proxy.size.width - cameraRight), height: proxy.size.height)
-                    .position(x: (cameraRight + proxy.size.width) / 2, y: proxy.size.height / 2)
-                    .allowsHitTesting(false)
+                // A physical black notch at the leading edge. It is outside
+                // the live viewport, matching the space reserved on the right.
+                if !portrait {
+                    Color.black
+                        .frame(width: leadingNotch, height: proxy.size.height)
+                        .position(x: leadingNotch / 2, y: proxy.size.height / 2)
+                        .allowsHitTesting(false)
+                }
                 viewfinder
                     .scaleEffect(ratioPreviewZoom)
-                    .frame(width: cameraRight, height: proxy.size.height)
+                    .frame(width: cameraWidth, height: proxy.size.height)
                     .overlay {
+                        if !camera.focusAuto {
+                            Text("PEAK")
+                                .font(.system(size: 8, weight: .bold, design: .rounded))
+                                .foregroundStyle(.red.opacity(0.9))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(.black.opacity(0.28), in: Capsule())
+                                .padding(10)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
                         if camera.exposureLocked {
                             // AE is a direct target gesture, not a second
                             // numeric ruler. Up/right raises it; down/left lowers it.
@@ -115,10 +160,13 @@ struct CameraScreen: View {
                             RoundedRectangle(cornerRadius: 5)
                                 .stroke(.yellow, lineWidth: 1.5)
                                 .frame(width: targetSize, height: targetSize)
+                                // Keep the visual square precise, but give a
+                                // thumb a forgiving transparent touch area.
+                                .padding(28)
                                 .contentShape(Rectangle())
-                                .position(x: min(cameraRight - halfSize, max(halfSize, exposureTarget.x * cameraRight)),
+                                .position(x: min(cameraWidth - halfSize, max(halfSize, exposureTarget.x * cameraWidth)),
                                           y: min(proxy.size.height - halfSize, max(halfSize, exposureTarget.y * proxy.size.height)))
-                                .gesture(DragGesture(minimumDistance: 12)
+                                .highPriorityGesture(DragGesture(minimumDistance: 4)
                                     .onChanged { drag in
                                         let horizontal = drag.translation.width
                                         let vertical = drag.translation.height
@@ -131,17 +179,25 @@ struct CameraScreen: View {
                                         withAnimation(.interactiveSpring(response: 0.16, dampingFraction: 0.82)) {
                                             exposureTargetPulse = scale
                                         }
+                                        if exposureTargetDragStartBias == nil {
+                                            exposureTargetDragStartBias = camera.exposureBias
+                                            exposureTargetLastStep = 0
+                                        }
+                                        // Slide directly on the target: every 18 points changes
+                                        // exposure by 0.1 EV. This makes a long upward/downward
+                                        // drag feel continuous rather than acting as one button.
+                                        let step = Int((primary / 18).rounded(.towardZero))
+                                        guard step != exposureTargetLastStep,
+                                              let startBias = exposureTargetDragStartBias else { return }
+                                        exposureTargetLastStep = step
+                                        camera.setExposureBias(startBias + Float(step) * 0.1)
                                     }
                                     .onEnded { drag in
-                                        let horizontal = drag.translation.width
-                                        let vertical = drag.translation.height
-                                        guard max(abs(horizontal), abs(vertical)) >= 18 else {
-                                            withAnimation(.spring(response: 0.25, dampingFraction: 0.75)) { exposureTargetPulse = 1 }
-                                            return
+                                        exposureTargetDragStartBias = nil
+                                        exposureTargetLastStep = 0
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.75)) {
+                                            exposureTargetPulse = 1
                                         }
-                                        let increase = abs(horizontal) >= abs(vertical)
-                                            ? horizontal > 0 : vertical < 0
-                                        adjustExposureTarget(increase: increase)
                                     })
                                 .accessibilityLabel("Locked exposure target")
                                 .accessibilityHint("Swipe up or right to raise exposure. Swipe down or left to lower exposure.")
@@ -149,36 +205,56 @@ struct CameraScreen: View {
                             RoundedRectangle(cornerRadius: 5)
                                 .stroke(.yellow, lineWidth: 1.5)
                                 .frame(width: 44, height: 44)
-                                .position(x: min(cameraRight - 24, max(24, target.x * cameraRight)),
+                                .position(x: min(cameraWidth - 24, max(24, target.x * cameraWidth)),
                                           y: min(proxy.size.height - 24, max(24, target.y * proxy.size.height)))
                                 .allowsHitTesting(false)
                         }
                     }
                     .clipShape(RoundedRectangle(cornerRadius: portrait ? 0 : 22, style: .continuous))
-                    .position(x: cameraRight / 2, y: proxy.size.height / 2)
+                    .position(x: previewFrame.midX, y: proxy.size.height / 2)
                 CompositionOverlay(safeLeft: orientation.windowSafeAreaInsets.left, safeRight: orientation.windowSafeAreaInsets.right,
                                    adjustmentExpanded: adjustmentExpanded, rightControls: rightControls,
+                                   leadingNotch: leadingNotch,
                                    framingEnabled: preferences.framingGuide, ratio: ratio, grid: grid, gridDensity: gridDensity, levelEnabled: levelEnabled,
                                    roll: camera.levelRoll, pitch: camera.levelPitch, levelIsCentered: camera.levelIsCentered, isPortrait: portrait)
                     .animation(.spring(response: 0.34, dampingFraction: 0.9), value: ratio)
 
-                if adjustmentExpanded || focusInspector || exposureInspector || colorDockExpanded || audioInspectorOpen || showGridChoices || showRatioChoices || showFormatChoices {
-                    transientControlsDismissalLayer(cameraRight: cameraRight, height: proxy.size.height)
+                // Draw the mousepad above the preview and its composition
+                // guides. The viewport no longer underlaps it, but rendering
+                // this surface last keeps the boundary visually unambiguous.
+                if !portrait {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .fill(InCamTheme.graphite.opacity(0.96))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                .stroke(.white.opacity(0.10), lineWidth: 1)
+                        }
+                        .frame(width: controlSurfaceFrame.width, height: controlSurfaceFrame.height)
+                        .position(x: controlSurfaceFrame.midX, y: controlSurfaceFrame.midY)
+                        .allowsHitTesting(false)
+                }
+
+                if adjustmentExpanded || focusInspector || exposureInspector || (AppFeatureAvailability.cameraColors && colorDockExpanded) || cameraColorProfilesOpen || cameraColorEditorOpen || audioInspectorOpen || showGridChoices || showRatioChoices || showFormatChoices || showScopeChoices || sceneScopeFocused || colorWheelExpanded || colorWorkspaceOpen {
+                    transientControlsDismissalLayer(cameraLeft: previewFrame.minX, cameraWidth: cameraWidth, height: proxy.size.height)
                 }
 
                 mainCameraOverlay(previewFrame: previewFrame, portrait: portrait, leftInset: leftInset)
 
-                if audioInspectorOpen && !portrait {
-                    CompactAudioInspector(onClose: { audioInspectorOpen = false })
-                        // A separate column beside Audio: this never covers
-                        // the fixed Audio / Grid / Format tool stack.
-                        .position(x: leftInset + 174, y: previewFrame.minY + 65)
-                        .zIndex(9)
+                if !portrait {
+                    // Keep the exposure column on the camera preview's right
+                    // side, then center it vertically within that preview.
+                    statisticsRail
+                        .frame(width: 64)
+                        .position(x: previewFrame.maxX - 36, y: previewFrame.midY)
+                        .zIndex(5)
                 }
 
                 elapsedReadout
                     .position(x: previewFrame.midX,
-                              y: previewFrame.minY + (portrait ? max(24, orientation.windowSafeAreaInsets.top + 22) : 26))
+                              // Landscape: 12-point timecode's visual top is
+                              // on the Audio card's y = 9 top edge, rather
+                              // than centered through that 34-point card.
+                              y: previewFrame.minY + (portrait ? max(24, orientation.windowSafeAreaInsets.top + 22) : 16))
                     .allowsHitTesting(false)
                     .zIndex(4)
 
@@ -189,16 +265,78 @@ struct CameraScreen: View {
                     CompositionCyclingRow(ratio: ratio, grid: grid, levelEnabled: levelEnabled,
                                           cycleRatio: cycleRatio, cycleGrid: cycleGrid,
                                           toggleLevel: { levelEnabled.toggle() })
-                        // The fixed Grid button is the second control in the
-                        // left stack (audio is first). Start this three-cell
+                        // Grid is now the first upper-left tool. Start this
+                        // three-cell row after the button so Ratio, Grid, and
+                        // Level never overlap the source button or each other.
+                        //
+                        // The separate scope selector directly below Format
+                        // controls Waveform/Histogram and is not a framing guide.
+                        // Start this three-cell
                         // row *after* that button, rather than on top of the
-                        // audio row, so Ratio, Grid, and Level never overlap
-                        // either the source button or each other.
-                        // Align with the Grid button's own center (the
-                        // middle item in the Audio / Grid / Format stack),
-                        // never with the lower 4K/format button.
-                        .position(x: leftInset + 178, y: previewFrame.minY + 68)
+                        // source button.
+                        // Anchor the chooser to the Grid tile's top-left
+                        // position; its first option begins just after Grid.
+                        .position(x: previewFrame.minX + 220, y: previewFrame.minY + 67)
                         .zIndex(8)
+                }
+
+                if !portrait && showScopeChoices {
+                    SceneScopeChoiceColumn(selection: sceneScopeMode, onSelect: updateSceneScopeFromPicker)
+                        // The held scope is the source of this point. The
+                        // current selection is the column's center item.
+                        .position(sceneScopeMenuLocation ?? CGPoint(x: previewFrame.minX + 190,
+                                                                     y: previewFrame.minY + 250))
+                        .zIndex(8)
+                }
+
+                if !portrait {
+                    // A tap reveals the compact profile tray; holding opens
+                    // the separate image-recipe workspace. Neither route
+                    // turns on live or recorded camera color rendering.
+                    ColorWorkspaceLauncher(
+                        diameter: railAccessoryDiameter,
+                        isExpanded: colorWheelExpanded,
+                        onTap: {
+                            dismissAdjustment()
+                            audioInspectorOpen = false
+                            showGridChoices = false
+                            showFormatChoices = false
+                            showScopeChoices = false
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+                                colorWheelExpanded.toggle()
+                            }
+                        },
+                        onOpenWorkspace: {
+                            colorWheelExpanded = false
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
+                                colorWorkspaceOpen = true
+                            }
+                        }
+                    )
+                    // Color Profiles is the bottom counterpart to the flip
+                    // button. Its bottom gap equals the rail's side gap.
+                    .position(x: captureCenter.x,
+                              y: colorAccessoryY)
+                    .zIndex(7)
+
+                    if colorWheelExpanded {
+                        ColorProfileTray(onOpenWorkspace: {
+                            colorWheelExpanded = false
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
+                                colorWorkspaceOpen = true
+                            }
+                        }, onDismiss: {
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
+                                colorWheelExpanded = false
+                            }
+                        })
+                        // The profile tray opens toward the image, where
+                        // there is room, while the wheel stays on the right.
+                        .position(x: controlSurfaceLeading - 64,
+                                  y: colorAccessoryY)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        .zIndex(7)
+                    }
                 }
 
                 if camera.exposureLocked {
@@ -212,12 +350,19 @@ struct CameraScreen: View {
                 }
 
                 if !portrait {
+                    // Flip is a full-size circular rail accessory at the top,
+                    // opposite the Color Profiles circle at the bottom.
+                    CameraFlipControl(diameter: railAccessoryDiameter)
+                        .position(x: captureCenter.x, y: flipAccessoryY)
+                        .zIndex(7)
                     modeToggle
-                        .position(x: cameraRight + 28, y: 42)
-                    settingsButton
-                        // Settings, Record, and Gallery share one fixed
-                        // vertical column through the grey control surface.
-                        .position(x: captureCenter.x, y: 42)
+                        .position(x: controlSurfaceLeading + 28, y: 42)
+                    if AppFeatureAvailability.settings {
+                        settingsButton
+                            // Settings, Record, and Gallery share one fixed
+                            // vertical column through the grey control surface.
+                            .position(x: captureCenter.x, y: 42)
+                    }
                     if !camera.focusAuto {
                         // Manual-focus gestures live behind the right-hand
                         // controls. Empty mousepad taps return to the normal
@@ -247,9 +392,25 @@ struct CameraScreen: View {
                         // The MF pad intentionally takes Record's place while
                         // its ruler is open. Tapping that pad closes the ruler
                         // and returns the normal Record control—no overlap.
-                        LandscapeCaptureCluster(onZoomBegin: { dismissAdjustment(); colorDockExpanded = false })
-                            .position(captureCenter)
-                            .zIndex(4)
+                        if previewZoomRulerVisible {
+                            VerticalZoomPanel { hidePreviewZoomRuler() }
+                                .position(captureCenter)
+                                .zIndex(4)
+                        } else {
+                            // This full-size container is the actual mousepad
+                            // rectangle. Its child rocker is aligned in local
+                            // coordinates, making the + / Record / − column
+                            // coincide exactly with the container's centre.
+                            ZStack {
+                                LandscapeCaptureCluster(onZoomBegin: { dismissAdjustment(); colorDockExpanded = false })
+                            }
+                            .frame(width: controlSurfaceFrame.width, height: controlSurfaceFrame.height)
+                            // Use the measured mousepad centre, not a preview
+                            // or screen-edge calculation, for every rocker
+                            // control in this column.
+                            .position(x: captureCenter.x, y: captureCenter.y)
+                                .zIndex(4)
+                        }
                     }
                     if focusInspector {
                         VStack(spacing: 5) {
@@ -271,7 +432,7 @@ struct CameraScreen: View {
                         .shadow(color: .black, radius: 3, y: 1)
                         .position(x: captureCenter.x, y: captureCenter.y - 18)
                         .zIndex(5)
-                    } else if colorDockExpanded {
+                    } else if AppFeatureAvailability.cameraColors && colorDockExpanded {
                         RightColorAdjustment(controls: colorControls)
                             .position(captureCenter)
                             .zIndex(5)
@@ -283,14 +444,55 @@ struct CameraScreen: View {
                         // bottom instead of giving Gallery an oversized gap.
                         .position(x: captureCenter.x, y: proxy.size.height - 42)
                         .zIndex(8)
-                    // Center the dock in what the camera sees, never in the
-                    // whole device window or the right-hand control surface.
-                    let dockLeft = activeGuideFrame.midX - dockWidth / 2
-                    let dockRight = dockLeft + dockWidth
-                    CameraColorDock(controls: colorControls, expanded: $colorDockExpanded)
-                        .frame(width: max(1, dockRight - dockLeft), height: colorDockHeight)
-                        .position(x: (dockLeft + dockRight) / 2, y: proxy.size.height - 8 - colorDockHeight / 2)
-                        .zIndex(6)
+                    // Custom Colors lives at the lower leading edge of the
+                    // image; its launcher is the only persistent color UI.
+                    if AppFeatureAvailability.cameraColors {
+                        CameraColorProfileLauncher(
+                            isDockExpanded: $cameraColorProfilesOpen,
+                            onAdd: {
+                                guard let slot = nextCustomColorSlot else { return }
+                                colorDockExpanded = false
+                                dismissAdjustment()
+                                colorControls.prepareNewCustomColor(at: slot)
+                                colorControls.cameraColorsEnabled = true
+                                cameraColorEditorSlot = slot
+                                cameraColorEditorOpen = true
+                            },
+                            onLoad: { slot in
+                                colorControls.selectCustomColor(at: slot, savedSlots: colors.quickSlots)
+                                colorControls.cameraColorsEnabled = true
+                                cameraColorProfilesOpen = false
+                            },
+                            onEdit: { slot in
+                                colorControls.selectCustomColor(at: slot, savedSlots: colors.quickSlots)
+                                cameraColorEditorSlot = slot
+                                cameraColorEditorOpen = true
+                            },
+                            onDelete: { slot in
+                                colors.deleteQuick(at: slot)
+                                if colorControls.loadedCustomSlot == slot {
+                                    colorControls.loadedCustomSlot = nil
+                                    colorControls.cameraColorsEnabled = false
+                                }
+                            }
+                        )
+                            .position(x: previewFrame.minX + leftInset + 48, y: proxy.size.height - 48)
+                            .zIndex(6)
+                    }
+                }
+
+                // Creating a profile is a real page, not a compact camera
+                // popover: the reference image and all three HSL bars remain
+                // visible without competing with the viewfinder controls.
+                if AppFeatureAvailability.cameraColors,
+                   cameraColorEditorOpen,
+                   let slot = cameraColorEditorSlot {
+                    CameraColorProfileEditorPage(controls: colorControls,
+                                                  slot: slot,
+                                                  isPresented: $cameraColorEditorOpen,
+                                                  isDockExpanded: $cameraColorProfilesOpen)
+                        .ignoresSafeArea()
+                        .zIndex(30)
                 }
 
                 if expandedDock == .zoom {
@@ -332,20 +534,45 @@ struct CameraScreen: View {
             camera.setCaptureRotation(orientation.rotationAngle)
             camera.setLevelInterfaceOrientation(orientation.interfaceOrientation)
             camera.setLevelMonitoringEnabled(levelEnabled)
+            // Queue saved assist preferences before camera.start(). This lets
+            // CameraController attach an enabled scope in its first session
+            // transaction rather than beginning preview and reconfiguring it
+            // immediately afterward.
+            camera.prepareViewfinderStartup(
+                scopeMode: sceneScopeMode,
+                focusPeakingEnabled: !camera.focusAuto
+            )
             updateOutputFraming()
             updateCameraActivity()
             grid = GridMode(rawValue: savedGridMode) ?? .off
             lastGrid = GridMode(rawValue: savedLastGridMode) ?? .thirds
             gridDensity = min(6, max(2, savedGridDensity))
-            camera.setCameraColorRecipe(colorControls.recipe)
+            if AppFeatureAvailability.cameraColors {
+                camera.setCameraColorRecipe(colorControls.recipe)
+            } else {
+                // Keep stored recipes untouched while forcing the active preview path
+                // to native, neutral camera output for the paused state.
+                colorDockExpanded = false
+                camera.setCameraColorsPreviewEnabled(false)
+                camera.setCameraColorRecipe(CameraColorRecipe(name: "Paused Camera Colors"))
+            }
             #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--show-controls") { expandedDock = .whiteBalance }
             if ProcessInfo.processInfo.arguments.contains("--show-iso") { controlPage = .iso; expandedDock = .iso }
             if ProcessInfo.processInfo.arguments.contains("--show-shutter") { controlPage = .shutter; expandedDock = .shutter }
             if ProcessInfo.processInfo.arguments.contains("--show-zoom") { openZoom() }
-            if ProcessInfo.processInfo.arguments.contains("--show-colors") { colorDockExpanded = true }
-            if ProcessInfo.processInfo.arguments.contains("--show-saturation") { colorControls.selection = "Saturation"; colorDockExpanded = true }
-            if ProcessInfo.processInfo.arguments.contains("--show-color-mix") { colorControls.selection = "Color Mix"; colorDockExpanded = true }
+            if AppFeatureAvailability.cameraColors,
+               ProcessInfo.processInfo.arguments.contains("--show-colors") { colorDockExpanded = true }
+            if AppFeatureAvailability.cameraColors && AppFeatureAvailability.basicColorControls,
+               ProcessInfo.processInfo.arguments.contains("--show-saturation") {
+                colorControls.selection = "Saturation"
+                colorDockExpanded = true
+            }
+            if AppFeatureAvailability.cameraColors,
+               ProcessInfo.processInfo.arguments.contains("--show-color-mix") {
+                colorControls.selection = "Color Mix"
+                colorDockExpanded = true
+            }
             if ProcessInfo.processInfo.arguments.contains("--show-exposure") { openExposure(at: CGPoint(x: 0.5, y: 0.5)) }
             if ProcessInfo.processInfo.arguments.contains("--show-exposure-right") { openExposure(at: CGPoint(x: 0.98, y: 0.5)) }
             if ProcessInfo.processInfo.arguments.contains("--show-grids") { showGridChoices = true; grid = .diagonals }
@@ -369,15 +596,22 @@ struct CameraScreen: View {
         }
         .onChange(of: gridDensity) { _, newValue in savedGridDensity = min(6, max(2, newValue)) }
         .onChange(of: levelEnabled) { _, enabled in camera.setLevelMonitoringEnabled(enabled) }
+        .onChange(of: camera.focusAuto) { _, isAuto in camera.setFocusPeakingEnabled(!isAuto) }
+        .onChange(of: savedSceneScopeMode) { _, _ in camera.setSceneScopeMode(sceneScopeMode) }
         .onChange(of: preferences.selectedRatio) { _, _ in updateOutputFraming() }
         .onChange(of: preferences.saveFramedOutput) { _, _ in updateOutputFraming() }
-        .onChange(of: colorControls.recipe) { _, recipe in camera.setCameraColorRecipe(recipe) }
+        .onChange(of: colorControls.recipe) { _, recipe in
+            guard AppFeatureAvailability.cameraColors else { return }
+            camera.setCameraColorRecipe(recipe)
+        }
         .onChange(of: camera.logModeEnabled) { _, enabled in
             // Do not leave a hidden Saturation/Contrast dial active in Log.
             if enabled && ["Saturation", "Contrast"].contains(colorControls.selection) {
-                colorControls.selection = "Clarity"
+                colorControls.selection = AppFeatureAvailability.basicColorControls ? "Clarity" : "Color Mix"
             }
-            camera.setCameraColorRecipe(colorControls.recipe)
+            if AppFeatureAvailability.cameraColors {
+                camera.setCameraColorRecipe(colorControls.recipe)
+            }
         }
         .onChange(of: camera.isRecording) { _, recording in
             orientation.setRecording(recording)
@@ -406,6 +640,10 @@ struct CameraScreen: View {
             }
         }
         .onChange(of: colorDockExpanded) { _, expanded in
+            guard AppFeatureAvailability.cameraColors else {
+                camera.setCameraColorsPreviewEnabled(false)
+                return
+            }
             camera.setCameraColorsPreviewEnabled(expanded)
             if expanded {
                 dismissAdjustment()
@@ -413,13 +651,31 @@ struct CameraScreen: View {
                 shortcutAdjustment = nil
             }
         }
+        .onChange(of: cameraColorProfilesOpen) { _, open in
+            if open {
+                // The circular Add control never shares the right inspector or
+                // activates the optional Camera Colors preview renderer.
+                colorDockExpanded = false
+                dismissAdjustment()
+            }
+        }
         .onChange(of: controlLayout) { _, _ in expandedDock = nil }
         .onChange(of: scenePhase) { _, _ in updateCameraActivity() }
         .onChange(of: showSettings) { _, _ in updateCameraActivity() }
         .onChange(of: showGallery) { _, _ in updateCameraActivity() }
         .onDisappear { camera.stop() }
-        .fullScreenCover(isPresented: $showSettings) { SettingsView() }
+        .overlay {
+            if AppFeatureAvailability.settings && showSettings {
+                settingsDrawer
+                    .transition(.opacity)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: showSettings)
         .sheet(isPresented: $showGallery) { SavedMediaGallery() }
+        .fullScreenCover(isPresented: $colorWorkspaceOpen) {
+            CameraColorEditorView(recipe: colorControls.recipe,
+                                  sourceSlot: colorControls.loadedCustomSlot)
+        }
         .alert("Camera", isPresented: Binding(
             get: { camera.lastError != nil },
             set: { if !$0 { camera.lastError = nil } }
@@ -427,10 +683,23 @@ struct CameraScreen: View {
           message: { Text(camera.lastError ?? "") }
     }
 
+    /// Settings fills the display while keeping a faint live viewfinder behind
+    /// the 90% material. Empty space around its tiles dismisses it, avoiding
+    /// a competing upward gesture near the system app switcher.
+    private var settingsDrawer: some View {
+        GeometryReader { proxy in
+            SettingsView(onDismiss: { showSettings = false }, backdropOpacity: 0.90)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .accessibilityIdentifier("settings.drawer")
+        }
+        .ignoresSafeArea()
+    }
+
     /// Keeps the portrait controls, left-side capture stack, and AF/readout
     /// rail out of the already large camera geometry view. Besides making the
     /// screen easier to review, this gives Swift a small unit to compile for
     /// physical devices rather than one monolithic inferred view type.
+    // Composes all live-view overlays above the preview using the measured display geometry.
     private func mainCameraOverlay(previewFrame: CGRect, portrait: Bool, leftInset: CGFloat) -> some View {
         VStack(spacing: 0) {
             if portrait { topBar(isPortrait: true) }
@@ -446,45 +715,85 @@ struct CameraScreen: View {
         .frame(width: previewFrame.width, height: previewFrame.height)
         .overlay {
             if !portrait {
+                // Keep monitoring controls against the left safe area.
+                // Align the entire left tool rail directly with the black
+                // notch boundary, rather than leaving an extra inner margin.
+                // Match the monitoring rail's leading inset to its top inset.
+                // This leaves one deliberate, even safe-area margin instead
+                // of a large empty strip beside the notch.
+                let railLeading: CGFloat = 9
+                // The first monitoring row shares the timer's visual band.
+                // A 34-point top row centered on the 26-point timer band.
+                let railTop: CGFloat = 9
                 leftCaptureToolStack
-                    .position(x: leftInset + 34, y: previewFrame.minY + 68)
+                    // A fixed top-left frame keeps the Audio launcher locked
+                    // in place. Its inspector therefore grows only downward.
+                    .padding(.bottom, railTop)
+                    .frame(width: previewFrame.width, height: previewFrame.height, alignment: .topLeading)
+                    .offset(x: railLeading, y: railTop)
             }
         }
-        .overlay(alignment: .topTrailing) {
+        .overlay(alignment: .bottomTrailing) {
             if !portrait {
-                VStack(alignment: .trailing, spacing: 8) {
-                    previewFocusModes
-                    cameraSwitchButton
-                    statisticsRail
-                }
-                .frame(width: 64)
-                .padding(.top, 9)
-                .padding(.trailing, 12)
+                // AF/MF is an on-screen tool, so it lives at the camera's
+                // lower-right corner rather than competing with the readouts.
+                previewFocusModes
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 18)
             }
         }
         .position(x: previewFrame.midX, y: previewFrame.midY)
         .zIndex(4)
     }
 
-    /// Audio, Grid, and format share one compact vertical left-safe-area stack.
+    /// The upper-left stack keeps capture monitoring in one left-aligned
+    /// column: L/R audio, storage/time, composition controls and scopes.
     private var leftCaptureToolStack: some View {
-        VStack(spacing: 8) {
-            Button(action: toggleAudioInspector) {
-                AudioLevelMeters(levels: camera.audioLevels, height: 20, showsChannelLabels: true, orientation: .horizontal)
-                    .frame(width: 46)
-                    .frame(width: 64, height: 34)
-                    .glass(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 24) {
+                audioMeterLauncher
+                CaptureStatusTile()
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Audio input and meters")
-            .accessibilityHint("Tap to adjust audio input settings")
-            .accessibilityIdentifier("camera.audio")
             gridPicker
-            CaptureFormatToolStack(isExpanded: $showFormatChoices, onOpen: {
+            CaptureFormatToolStack(isExpanded: $showFormatChoices) {
+                dismissAdjustment()
+                clearFocusTarget()
                 showGridChoices = false
                 showRatioChoices = false
+                showScopeChoices = false
+            }
+            // Keep ordinary left-side controls fixed at the top. The scope is
+            // independently pinned to the preview's bottom-left, so opening
+            // it never pushes Audio, storage, Grid, or format controls.
+            Spacer(minLength: 0)
+            SceneScopeTool(mode: sceneScopeMode,
+                           redSamples: camera.sceneScopeRedSamples,
+                           greenSamples: camera.sceneScopeGreenSamples,
+                           blueSamples: camera.sceneScopeBlueSamples,
+                           isExpanded: $sceneScopeExpanded,
+                           isCollapsed: $sceneScopeCollapsed,
+                           isFocused: $sceneScopeFocused,
+                           onTap: activateSceneScope) { location in
+                dismissAdjustment()
                 clearFocusTarget()
-            })
+                showGridChoices = false
+                showRatioChoices = false
+                showFormatChoices = false
+                sceneScopeFocused = true
+                sceneScopeMenuLocation = location
+                showScopeChoices = true
+            }
+            // Pull the bottom-left monitor away from the rounded viewport
+            // corner while retaining its bottom anchor for upward growth.
+            .padding(.bottom, 18)
+        }
+    }
+
+/// Audio is a compact live indicator at rest. Holding it reveals only its
+/// quick settings below the meter; the full vertical meter is not repeated.
+    private var audioMeterLauncher: some View {
+        AudioMeterLauncher(levels: camera.audioLevels, isExpanded: audioInspectorOpen) {
+            toggleAudioInspector()
         }
     }
 
@@ -494,18 +803,21 @@ struct CameraScreen: View {
             CameraPreview(camera: camera, onFocusHold: { devicePoint, displayPoint in
                 camera.focus(at: devicePoint)
                 showFocusTarget(at: displayPoint)
-            }, onExposureTap: { openExposure(at: $0) }, onLensPinch: { towardTelephoto in
-                // Pinch switches only between physical iPhone lenses. The
-                // existing right-hand controls remain responsible for zoom.
-                camera.cycleLens(towardTelephoto: towardTelephoto)
+            }, onExposureTap: { devicePoint, displayPoint in
+                openExposure(at: displayPoint, devicePoint: devicePoint)
+            }, onZoomPinch: { scale, finished in
+                handlePreviewPinchZoom(scale: scale, finished: finished)
             })
                 // Basic recipe controls use SwiftUI's compositor over the
                 // native preview layer. The Metal Color Mix view already
                 // includes these values through RecipeRenderer, so never
                 // apply them a second time while it is active.
-                .saturation(!camera.selectiveColorPreviewActive && !camera.logModeEnabled ? 1 + colorControls.recipe.saturation : 1)
-                .contrast(!camera.selectiveColorPreviewActive && !camera.logModeEnabled ? 1 + colorControls.recipe.contrast + max(0, colorControls.recipe.clarity) * 0.20 : 1)
-                .blur(radius: !camera.selectiveColorPreviewActive ? max(0, -colorControls.recipe.clarity) * 1.4 : 0)
+                // The Color dock itself is lightweight. Keep these costly
+                // per-frame SwiftUI compositors off while its basic renderer
+                // is paused, so opening the app does not burden the preview.
+                .saturation(AppFeatureAvailability.cameraColors && AppFeatureAvailability.basicColorControls && !camera.selectiveColorPreviewActive && !camera.logModeEnabled ? 1 + colorControls.recipe.saturation : 1)
+                .contrast(AppFeatureAvailability.cameraColors && AppFeatureAvailability.basicColorControls && !camera.selectiveColorPreviewActive && !camera.logModeEnabled ? 1 + colorControls.recipe.contrast + max(0, colorControls.recipe.clarity) * 0.20 : 1)
+                .blur(radius: AppFeatureAvailability.cameraColors && AppFeatureAvailability.basicColorControls && !camera.selectiveColorPreviewActive ? max(0, -colorControls.recipe.clarity) * 1.4 : 0)
                 .accessibilityIdentifier("camera.preview")
                 .accessibilityLabel("Camera preview")
                 .accessibilityHint("Tap to lock exposure. Touch and hold a subject for one second to focus.")
@@ -541,6 +853,7 @@ struct CameraScreen: View {
         }
     }
 
+    // Builds the top status row containing timer, focus mode and compact exposure readouts.
     private func topBar(isPortrait: Bool) -> some View {
         VStack(spacing: 4) {
             if isPortrait { Color.clear.frame(height: 36) }
@@ -582,9 +895,10 @@ struct CameraScreen: View {
     private var shutterReadout: String {
         // Speed mode reflects the live automatic exposure. Angle mode holds
         // its chosen value steady until the person changes shutter or FPS.
-        let displaySeconds = camera.shutterAngleMode
-            ? camera.lastManualExposureSeconds
-            : camera.exposureSeconds
+        if camera.shutterAngleMode {
+            return CameraExposureDefaults.shutterAngleLabel(camera.shutterAngleDegrees)
+        }
+        let displaySeconds = camera.exposureSeconds
         let seconds = CameraExposureDefaults.displayDuration(
             for: displaySeconds,
             frameRate: camera.frameRate,
@@ -592,9 +906,6 @@ struct CameraScreen: View {
             supportedRange: camera.capabilities.manualExposureRange
         )
         guard seconds.isFinite, seconds > 0 else { return "—" }
-        if camera.shutterAngleMode {
-            return "\(Int(min(360, (seconds * Double(max(1, camera.frameRate)) * 360).rounded())))°"
-        }
         return CameraExposureDefaults.speedLabel(seconds)
     }
 
@@ -604,6 +915,7 @@ struct CameraScreen: View {
         "\(Int(camera.iso.rounded()))"
     }
 
+    // Creates one tappable compact readout that opens its associated adjustment page.
     private func statusButton(_ title: String, value: String, page: CameraControlPage) -> some View {
         Button {
             controlPage = page
@@ -616,9 +928,14 @@ struct CameraScreen: View {
                     Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold))
                 }
                 HStack {
-                    Text(value).font(.system(size: 10, weight: .semibold)).monospacedDigit()
+                    // Yellow carries the complete Auto state on the compact
+                    // camera readout. Manual values stay ivory, so the old
+                    // duplicated A / M letters are no longer needed.
+                    Text(value)
+                        .font(.system(size: 10, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(autoState(for: page) ? .yellow : InCamTheme.ivory)
                     Spacer(minLength: 2)
-                    modePair(auto: autoState(for: page))
                 }
             }
             .padding(.horizontal, 10).frame(width: 112, height: 44)
@@ -635,13 +952,7 @@ struct CameraScreen: View {
         .simultaneousGesture(TapGesture(count: 2).onEnded { resetControl(page) })
     }
 
-    private func modePair(auto: Bool, focus: Bool = false) -> some View {
-        HStack(spacing: 4) {
-            Text(focus ? "AF" : "A").foregroundStyle(auto ? .yellow : InCamTheme.ivory.opacity(0.32))
-            Text(focus ? "MF" : "M").foregroundStyle(auto ? InCamTheme.ivory.opacity(0.32) : .yellow)
-        }.font(.system(size: 9, weight: .bold))
-    }
-
+    // Reads the correct automation state for an exposure/focus control page.
     private func autoState(for page: CameraControlPage) -> Bool {
         switch page {
         case .whiteBalance: return camera.whiteBalanceAuto
@@ -653,36 +964,49 @@ struct CameraScreen: View {
     }
 
     private var statisticsRail: some View {
-        VStack(alignment: .trailing, spacing: 8) {
+        // Values are the usable information here. Tighter rhythm and a
+        // slightly larger type size make WB, tint, shutter and ISO readable
+        // without pushing the AF control or capture column.
+        VStack(alignment: .trailing, spacing: 4) {
             statistic("WB", "\(Int(camera.temperature)) K", auto: camera.whiteBalanceAuto, page: .whiteBalance)
             statistic("TINT", String(format: "%+.0f", camera.tint / 12), auto: camera.tintAuto, page: .tint)
             statistic("SHUTTER", shutterReadout, auto: camera.shutterAuto, page: .shutter)
             statistic("ISO", isoReadout, auto: camera.isoAuto, page: .iso)
-            if camera.aperture > 0 {
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(String(format: "ƒ%.1f", camera.aperture))
-                        .font(.system(size: 10, weight: .medium)).monospacedDigit()
-                    Text("FIXED").font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(InCamTheme.ivory.opacity(0.42))
-                }
-                .frame(maxWidth: .infinity, minHeight: 32, alignment: .trailing)
-                .accessibilityLabel("Lens aperture")
-                .accessibilityValue(String(format: "f %.1f, fixed by this lens", camera.aperture))
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(camera.aperture > 0 ? String(format: "ƒ%.1f", camera.aperture) : "ƒ—")
+                    .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                Text(camera.aperture > 0 ? "FIXED" : "UNAVAILABLE")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(InCamTheme.ivory.opacity(0.42))
             }
+            .frame(maxWidth: .infinity, minHeight: 28, alignment: .trailing)
+            .opacity(0.42)
+            .accessibilityLabel("Lens aperture")
+            .accessibilityValue(camera.aperture > 0
+                ? String(format: "f %.1f, fixed by this lens", camera.aperture)
+                : "Unavailable for the active camera")
         }.buttonStyle(PressScaleStyle())
             .shadow(color: .black, radius: 3, y: 1)
     }
 
+    // Builds one right-aligned camera statistic row that can open the matching dial.
     private func statistic(_ title: String, _ value: String, auto: Bool, page: CameraControlPage) -> some View {
-        Button {
-            let close = expandedDock != nil && controlPage == page
+        let isActive = expandedDock != nil && controlPage == page
+        return Button {
+            let close = isActive
             controlPage = page
             expandedDock = close ? nil : page.dockItem
         } label: { VStack(alignment: .trailing, spacing: 2) {
-            Text(value).font(.system(size: 10, weight: .medium)).monospacedDigit().lineLimit(1)
-            modePair(auto: auto)
-        }.frame(maxWidth: .infinity, minHeight: 44, alignment: .trailing).contentShape(Rectangle()) }
-        .foregroundStyle(expandedDock != nil && controlPage == page ? .yellow : InCamTheme.ivory.opacity(0.8))
+            // Auto is yellow and Manual is ivory. The scroll/ruler remains
+            // the place where a person changes that mode; this rail only
+            // reports the result without spending space on A/M labels.
+            Text(value)
+                .font(.system(size: 13, weight: .semibold))
+                .monospacedDigit()
+                .lineLimit(1)
+        }.frame(maxWidth: .infinity, minHeight: 34, alignment: .trailing).contentShape(Rectangle()) }
+        .foregroundStyle(isActive || auto ? .yellow : InCamTheme.ivory)
+        .opacity(isActive ? 1 : 0.42)
         .accessibilityLabel(page.title(for: camera.mode)).accessibilityValue(value)
         .accessibilityHint("Open adjustment at the Record button position")
         .accessibilityIdentifier("status.\(title.lowercased())")
@@ -691,6 +1015,7 @@ struct CameraScreen: View {
 
     /// Readout and dial double-taps share the same predictable baselines.
     /// The viewfinder itself keeps double-tap for AE Lock and target placement.
+    // Restores the selected adjustment page to its intended neutral/automatic state.
     private func resetControl(_ page: CameraControlPage) {
         switch page {
         case .whiteBalance:
@@ -752,6 +1077,7 @@ struct CameraScreen: View {
         .accessibilityIdentifier("grid.choose")
     }
 
+    // Advances through enabled composition ratios and refreshes any output-framing request.
     private func cycleRatio() {
         guard !camera.isRecording else { return }
         let choices = preferences.ratioShortcuts
@@ -760,6 +1086,7 @@ struct CameraScreen: View {
         preferences.selectedRatio = choices[(index + 1) % choices.count]
     }
 
+    // Converts a grid enum into the compact label shown beside the grid button.
     private func gridName(_ mode: GridMode) -> String {
         switch mode {
         case .off: return "Off"
@@ -770,11 +1097,13 @@ struct CameraScreen: View {
         }
     }
 
+    // Opens the zoom adjustment ruler and hides unrelated transient controls.
     private func openZoom() {
         controlPage = .zoom
         expandedDock = .zoom
     }
 
+    // Closes the expanded dock/inspector while retaining the camera's current values.
     private func dismissAdjustment() {
         cancelFocusInspectorDismissal()
         focusInspector = false
@@ -785,31 +1114,88 @@ struct CameraScreen: View {
     /// Closes every temporary inspector after an outside double-tap. Keeping
     /// these assignments in a helper avoids an overly complex SwiftUI gesture
     /// closure, which otherwise fails to compile for a physical iPhone target.
+    // Clears short-lived overlays such as focus, AE, zoom and temporary pickers after a background tap.
     private func dismissTransientControls() {
+        // The scope gets a quicker shrink/fade than the surrounding HUD so a
+        // tap on empty preview feels immediately conclusive.
+        withAnimation(.easeOut(duration: 0.12)) {
+            sceneScopeExpanded = false
+            sceneScopeFocused = false
+        }
         dismissAdjustment()
         clearFocusTarget()
         colorDockExpanded = false
+        cameraColorProfilesOpen = false
+        cameraColorEditorOpen = false
         audioInspectorOpen = false
         showGridChoices = false
         showRatioChoices = false
         showFormatChoices = false
+        showScopeChoices = false
+        sceneScopeMenuLocation = nil
+        colorWheelExpanded = false
+        colorWorkspaceOpen = false
     }
 
     /// Audio opens as the only left-side tool inspector. This isolated action
     /// keeps the view-builder closure simple enough for device compilation.
+    // Opens or closes the audio inspector while ensuring other expanded controls are dismissed.
     private func toggleAudioInspector() {
         dismissAdjustment()
         clearFocusTarget()
         colorDockExpanded = false
+        cameraColorProfilesOpen = false
         showRatioChoices = false
         showGridChoices = false
         showFormatChoices = false
+        showScopeChoices = false
+        sceneScopeMenuLocation = nil
+        colorWheelExpanded = false
         audioInspectorOpen.toggle()
+    }
+
+    /// Switches the scene analyser. The controller adds its video-data output
+    /// only for Waveform/Histogram; Off removes it again to protect startup
+    /// and recording responsiveness.
+    private func selectSceneScope(_ mode: SceneScopeMode) {
+        savedSceneScopeMode = mode.rawValue
+        showScopeChoices = false
+        sceneScopeMenuLocation = nil
+    }
+
+    /// Taps use one predictable sequence: the folded circle restores the
+    /// Histogram, Histogram switches to Waveform, and Waveform returns to
+    /// Histogram. Horizontal swipes are not used to enlarge the monitor.
+    private func activateSceneScope(fromCollapsed: Bool) {
+        sceneScopeFocused = true
+        if fromCollapsed || sceneScopeMode == .off {
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                sceneScopeExpanded = false
+            }
+            savedSceneScopeMode = SceneScopeMode.histogram.rawValue
+        } else {
+            // The scope now sits at the preview's bottom-left. Its bottom
+            // anchor stays fixed, so this larger monitor grows right and up.
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                sceneScopeExpanded = true
+            }
+            savedSceneScopeMode = sceneScopeMode == .histogram
+                ? SceneScopeMode.waveform.rawValue
+                : SceneScopeMode.histogram.rawValue
+        }
+    }
+
+    /// While the thumb-held picker is on screen, update the monitor but keep
+    /// the picker open and centered at that same thumb location. An outside
+    /// tap still dismisses it through the normal transient-control path.
+    private func updateSceneScopeFromPicker(_ mode: SceneScopeMode) {
+        savedSceneScopeMode = mode.rawValue
     }
 
     /// A focus target confirms the tap briefly, then fades away without
     /// changing the camera's actual focus mode or point. Any on-screen tool
     /// action also clears it immediately, keeping the composition UI clean.
+    // Shows the visible focus target and schedules its UI-only disappearance without undoing focus.
     private func showFocusTarget(at point: CGPoint) {
         focusTargetDismissWorkItem?.cancel()
         focusTarget = point
@@ -821,6 +1207,7 @@ struct CameraScreen: View {
     /// The ruler is a temporary second view over Record. Moving it locks the
     /// chosen focus position; releasing it for a moment restores Record while
     /// leaving that manual focus intact, including during a recording.
+    // Delays focus-inspector dismissal briefly so a drag can finish before Record returns.
     private func scheduleFocusInspectorDismissal() {
         focusInspectorDismissWorkItem?.cancel()
         let work = DispatchWorkItem { focusInspector = false }
@@ -828,13 +1215,15 @@ struct CameraScreen: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
     }
 
+    // Cancels the pending focus-inspector timeout when the person resumes touching the control.
     private func cancelFocusInspectorDismissal() {
         focusInspectorDismissWorkItem?.cancel()
         focusInspectorDismissWorkItem = nil
     }
 
+    // Sends the selected composition aspect to the controller's output-framing save path.
     private func updateOutputFraming() {
-        guard !camera.isRecording, preferences.saveFramedOutput, preferences.framingGuide else {
+        guard !camera.isRecording, preferences.framingGuide else {
             if !camera.isRecording { camera.setOutputFraming(aspect: nil) }
             return
         }
@@ -842,6 +1231,7 @@ struct CameraScreen: View {
         camera.setOutputFraming(aspect: aspect)
     }
 
+    // Removes focus-target UI only; it intentionally leaves the lens focus where it was set.
     private func clearFocusTarget() {
         focusTargetDismissWorkItem?.cancel()
         focusTargetDismissWorkItem = nil
@@ -852,18 +1242,19 @@ struct CameraScreen: View {
     /// main camera body is intentionally dense, so isolating this gesture
     /// avoids the physical-device compiler timing out while preserving its
     /// single-tap dismissal and double-tap exposure-lock behavior.
-    private func transientControlsDismissalLayer(cameraRight: CGFloat, height: CGFloat) -> some View {
+    // Defines the transparent viewfinder tap region used to dismiss temporary controls.
+    private func transientControlsDismissalLayer(cameraLeft: CGFloat, cameraWidth: CGFloat, height: CGFloat) -> some View {
         Color.black.opacity(0.001)
             .contentShape(Rectangle())
             // Keep this invisible tap catcher inside the live image. A
             // full-screen catcher can otherwise absorb dock/right-pad taps.
-            .frame(width: cameraRight, height: height)
-            .position(x: cameraRight / 2, y: height / 2)
+            .frame(width: cameraWidth, height: height)
+            .position(x: cameraLeft + cameraWidth / 2, y: height / 2)
             .gesture(SpatialTapGesture(count: 2).exclusively(before: SpatialTapGesture()).onEnded { value in
                 switch value {
                 case .first(let tap):
-                    guard tap.location.x <= cameraRight else { return }
-                    openExposure(at: CGPoint(x: tap.location.x / cameraRight, y: tap.location.y / height))
+                    guard tap.location.x >= cameraLeft, tap.location.x <= cameraLeft + cameraWidth else { return }
+                    openExposure(at: CGPoint(x: (tap.location.x - cameraLeft) / cameraWidth, y: tap.location.y / height))
                 case .second:
                     dismissTransientControls()
                 }
@@ -876,14 +1267,28 @@ struct CameraScreen: View {
         Button {
             dismissAdjustment()
             colorDockExpanded = false
+            cameraColorProfilesOpen = false
             showGridChoices = false
             showRatioChoices = false
             focusTarget = nil
-            // Opening AF shows the current live lens position. It does not
-            // lock focus until the person actually moves the ruler.
-            focusInspector = true
+            // One explicit toggle: AF returns to continuous autofocus; MF
+            // locks the current lens position and opens its thumb ruler.
+            if camera.focusAuto {
+                camera.setFocus(auto: false, position: camera.focusPosition)
+                focusInspector = true
+            } else {
+                cancelFocusInspectorDismissal()
+                camera.setFocus(auto: true)
+                focusInspector = false
+            }
         } label: {
-            Text(camera.focusAuto ? "AF" : "MF")
+            HStack(spacing: 3) {
+                Text(camera.focusAuto ? "AF" : "MF")
+                if !camera.focusAuto {
+                    Image(systemName: "arrow.up.and.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+            }
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.yellow)
                 .frame(width: 64, height: 34)
@@ -894,46 +1299,26 @@ struct CameraScreen: View {
         .buttonStyle(.plain)
         .accessibilityLabel("Focus mode")
         .accessibilityValue(camera.focusAuto ? "AF" : "MF")
-        .accessibilityHint("Tap to show focus. Adjust to lock manual focus; double-tap to return to autofocus")
+        .accessibilityHint(camera.focusAuto
+            ? "Tap to lock manual focus and open the focus ruler"
+            : "Tap for continuous autofocus. While recording, drag vertically on the right control area to adjust manual focus")
         .accessibilityIdentifier("focus.toggle")
-        .simultaneousGesture(TapGesture(count: 2).onEnded {
-            cancelFocusInspectorDismissal()
-            camera.setFocus(auto: true)
-            focusInspector = false
-        })
     }
 
-    /// Lives above WB in the same compact trailing rail as AF/MF and the
-    /// camera readouts. It does not compete with the Record control column.
-    private var cameraSwitchButton: some View {
-        Button { camera.toggleCameraPosition() } label: {
-            Image(systemName: "camera.rotate")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.yellow)
-                .frame(width: 64, height: 30)
-                .glass(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .disabled(camera.isRecording)
-        .opacity(camera.isRecording ? 0.45 : 1)
-        .accessibilityLabel("Switch camera")
-        .accessibilityValue(camera.isFrontCamera ? "Front camera" : "Rear camera")
-        .accessibilityHint("Switches between the front and rear cameras")
-        .accessibilityIdentifier("camera.switch")
-    }
-
-    private func openExposure(at point: CGPoint) {
+    // Locks/repositions AE at the tapped preview point and opens the compact exposure target UI.
+    private func openExposure(at point: CGPoint, devicePoint: CGPoint? = nil) {
         exposureTarget = CGPoint(x: min(1, max(0, point.x)), y: min(1, max(0, point.y)))
         focusTarget = exposureTarget
         dismissAdjustment()
         colorDockExpanded = false
         showGridChoices = false
         showRatioChoices = false
-        if !camera.exposureLocked { camera.toggleExposureLock() }
+        camera.lockExposure(at: devicePoint)
     }
 
     /// A completed target drag changes exposure one step, then settles its
     /// continuously-scaled 0.8×...1.5× feedback square back to neutral.
+    // Steps the active AE-lock target by the defined EV increment and keeps its UI synchronized.
     private func adjustExposureTarget(increase: Bool) {
         camera.adjustExposureBias(by: increase ? 0.3 : -0.3)
         withAnimation(.spring(response: 0.30, dampingFraction: 0.72)) {
@@ -961,7 +1346,12 @@ struct CameraScreen: View {
     }
 
     private var settingsButton: some View {
-        Button { dismissAdjustment(); clearFocusTarget(); showSettings = true } label: {
+        Button {
+            guard AppFeatureAvailability.settings else { return }
+            dismissAdjustment()
+            clearFocusTarget()
+            showSettings = true
+        } label: {
             Image(systemName: "gearshape.fill")
                 .font(.system(size: 17, weight: .medium))
                 .frame(width: 52, height: 52)
@@ -975,54 +1365,100 @@ struct CameraScreen: View {
     /// Gallery remains lower in the fixed right column with the same compact
     /// target and edge padding as Settings at the top-right of that surface.
     private var rightColumnUtilities: some View {
-        Button { openGalleryOrStopRecording() } label: {
-            Image(systemName: "photo.on.rectangle")
-                .font(.system(size: 16, weight: .medium))
-                .frame(width: 52, height: 52)
-                .glass(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        Group {
+            if AppFeatureAvailability.gallery {
+                Button { openGalleryOrStopRecording() } label: {
+                    Image(systemName: "photo.on.rectangle")
+                        .font(.system(size: 16, weight: .medium))
+                        .frame(width: 52, height: 52)
+                        .glass(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                .accessibilityLabel("Saved photos and videos")
+                .accessibilityIdentifier("gallery.open")
+                .buttonStyle(PressScaleStyle())
+            }
         }
-        .accessibilityLabel("Saved photos and videos")
-        .accessibilityIdentifier("gallery.open")
-        .buttonStyle(PressScaleStyle())
     }
 
     private var modeAndSettings: some View {
         HStack(spacing: 8) {
             modeToggle
 
-            Button { openGalleryOrStopRecording() } label: {
-                Image(systemName: "photo.on.rectangle")
-                    .font(.system(size: 14)).frame(width: 38, height: 36)
-                    .glass(in: Capsule())
-            }.accessibilityLabel("Saved photos and videos")
-
-            Button { dismissAdjustment(); clearFocusTarget(); showSettings = true } label: {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 15))
-                    .frame(width: 38, height: 36)
-                    .glass(in: Capsule())
+            if AppFeatureAvailability.gallery {
+                Button { openGalleryOrStopRecording() } label: {
+                    Image(systemName: "photo.on.rectangle")
+                        .font(.system(size: 14)).frame(width: 38, height: 36)
+                        .glass(in: Capsule())
+                }.accessibilityLabel("Saved photos and videos")
             }
-            .accessibilityLabel("Settings")
+
+            if AppFeatureAvailability.settings {
+                Button { dismissAdjustment(); clearFocusTarget(); showSettings = true } label: {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 15))
+                        .frame(width: 38, height: 36)
+                        .glass(in: Capsule())
+                }
+                .accessibilityLabel("Settings")
+            }
         }
         .buttonStyle(PressScaleStyle())
     }
 
     /// Gallery is also a deliberate stop-recording target. This avoids opening
     /// an empty gallery while MovieFileOutput is still finalizing the clip.
+    // Opens Gallery when idle, or stops an in-progress recording instead of hiding capture controls.
     private func openGalleryOrStopRecording() {
         if camera.isRecording {
             camera.capture()
-        } else {
+        } else if AppFeatureAvailability.gallery {
             showGallery = true
         }
     }
 
-    /// The camera is intentionally active only when its actual viewfinder is
-    /// usable. Settings, Audio, Gallery, app switching, and backgrounding all
-    /// release the camera, microphone meter, motion sensor, and zoom work.
+    /// A preview pinch never moves Record. It only borrows that fixed control
+    /// slot for the existing zoom ruler, then restores the original +/- rocker
+    /// shortly after the gesture finishes.
+    // Converts live pinch scale into lens zoom, temporarily replacing Record with the zoom ruler.
+    private func handlePreviewPinchZoom(scale: CGFloat, finished: Bool) {
+        previewZoomDismissWorkItem?.cancel()
+        if previewZoomOrigin == nil {
+            previewZoomOrigin = camera.zoom
+            previewZoomRulerVisible = true
+            dismissAdjustment()
+            colorDockExpanded = false
+        }
+        if let origin = previewZoomOrigin {
+            camera.setZoom(origin * scale)
+        }
+        guard finished else { return }
+        previewZoomOrigin = nil
+        camera.stopZoomRamp()
+        let work = DispatchWorkItem { previewZoomRulerVisible = false }
+        previewZoomDismissWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65, execute: work)
+    }
+
+    // Restores the normal Record layout after pinch zoom and stops any ongoing zoom ramp.
+    private func hidePreviewZoomRuler() {
+        previewZoomDismissWorkItem?.cancel()
+        previewZoomOrigin = nil
+        previewZoomRulerVisible = false
+        camera.stopZoomRamp()
+    }
+
+    /// The camera is released for app backgrounding and when this screen goes
+    /// away, but stays warm while an idle person opens InCam's own Settings or
+    /// Gallery. That avoids reacquiring the lens every time an internal panel
+    /// closes. Opening Settings during an active recording preserves the
+    /// previous stop-on-navigation behavior rather than changing movie capture
+    /// semantics without an explicit recording workflow.
     private func updateCameraActivity() {
-        let cameraVisible = !showSettings && !showGallery
-        if scenePhase == .active && cameraVisible {
+        let settingsVisible = AppFeatureAvailability.settings && showSettings
+        let galleryVisible = AppFeatureAvailability.gallery && showGallery
+        let cameraVisible = !settingsVisible && !galleryVisible
+        let keepWarmForInternalPanel = !camera.isRecording && (settingsVisible || galleryVisible)
+        if scenePhase == .active && (cameraVisible || keepWarmForInternalPanel) {
             camera.start()
         } else {
             camera.stop()
@@ -1040,6 +1476,7 @@ struct CameraScreen: View {
         .frame(height: 184)
     }
 
+    // Chooses the portrait or landscape arrangement for capture, dock and shortcut controls.
     private func bottomControls(isPortrait: Bool) -> some View {
         ZStack(alignment: .bottom) {
             if isPortrait && controlLayout == .dock && expandedDock != nil && expandedDock != .zoom {
@@ -1097,6 +1534,7 @@ struct CameraScreen: View {
         .frame(height: isPortrait && controlLayout == .dock && expandedDock != nil && expandedDock != .zoom ? (preferences.showQuickRow ? 216 : 172) : 76, alignment: .bottom)
     }
 
+    // Creates a portrait-safe shortcut arc anchored to the requested screen side.
     private func portraitShortcut(_ side: ShortcutSide) -> some View {
         let actions = (side == .leading ? shortcuts.c1 : shortcuts.c2).enumerated().filter { $0.element != .unassigned }
         let name = side == .leading ? shortcuts.c1Name : shortcuts.c2Name
@@ -1104,7 +1542,13 @@ struct CameraScreen: View {
             ForEach(actions, id: \.offset) { entry in
                 Button(entry.element.rawValue) { activateShortcut(entry.element, index: entry.offset, side: side) }
             }
-            if actions.isEmpty { Button("Assign in Settings") { showSettings = true } }
+            if actions.isEmpty, AppFeatureAvailability.settings {
+                Button("Assign in Settings") { showSettings = true }
+            } else if actions.isEmpty {
+                Text("No shortcut assigned")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
         } label: {
             Text(actions.count == 1 ? actions[0].element.rawValue : name)
                 .font(.system(size: 11, weight: .semibold))
@@ -1113,6 +1557,7 @@ struct CameraScreen: View {
         }
     }
 
+    // Cycles grid visibility/mode and persists the chosen composition overlay state.
     private func cycleGrid() {
         let active = GridMode.choices
         let index = active.firstIndex(of: grid) ?? -1
@@ -1121,6 +1566,7 @@ struct CameraScreen: View {
         grid = next
     }
 
+    // Dispatches a selected shortcut to the matching camera or presentation action.
     private func activateShortcut(_ action: ShortcutAction, index: Int, side: ShortcutSide) {
         let supportsRail: Bool
         switch action {
@@ -1159,9 +1605,16 @@ struct CameraScreen: View {
         }
     }
 
+    // Formats a recording duration as HH:MM:SS:FF using the active frame rate.
     private func format(_ interval: TimeInterval) -> String {
-        let seconds = Int(interval)
-        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+        let framesPerSecond = max(1, camera.frameRate)
+        let totalFrames = max(0, Int((interval * Double(framesPerSecond)).rounded(.down)))
+        let totalSeconds = totalFrames / framesPerSecond
+        let frames = totalFrames % framesPerSecond
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%02d:%02d:%02d:%02d", hours, minutes, seconds, frames)
     }
 }
 
@@ -1562,18 +2015,50 @@ private struct AdjustmentLine: View {
 private struct LandscapeCaptureCluster: View {
     @EnvironmentObject private var camera: CameraController
     let onZoomBegin: () -> Void
+
     var body: some View {
         Group {
             if camera.mode == .video {
+                // The red Record control is the geometric center of the
+                // charcoal capture rectangle. Plus and minus are the visible
+                // zoom affordances immediately above and below the record
+                // target; camera flip is a separate full-size rail accessory.
                 CamcorderCaptureRocker(onZoomBegin: onZoomBegin)
+                .frame(width: 88, height: 260)
             } else {
-                VStack(spacing: 12) {
+                ZStack {
                     CaptureButton(size: 70)
                     CaptureAccessory(compact: true, onZoomBegin: onZoomBegin)
+                        .offset(y: 76)
                 }
+                .frame(width: 88, height: 260)
             }
         }
-        .frame(width: 88, height: 190)
+        .frame(width: 88, height: 260)
+    }
+}
+
+/// The record column's direct front/rear switch. The icon deliberately shows
+/// only the two rotating arrows, without the camera glyph used by the old rail.
+private struct CameraFlipControl: View {
+    @EnvironmentObject private var camera: CameraController
+    var diameter: CGFloat = 32
+
+    var body: some View {
+        Button { camera.toggleCameraPosition() } label: {
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                .font(.system(size: diameter * 0.58, weight: .semibold))
+                .foregroundStyle(InCamTheme.ivory)
+                .frame(width: diameter, height: diameter)
+                .glass(in: Circle())
+        }
+        .buttonStyle(PressScaleStyle())
+        .disabled(camera.isRecording)
+        .opacity(camera.isRecording ? 0.45 : 1)
+        .accessibilityLabel("Switch camera")
+        .accessibilityValue(camera.isFrontCamera ? "Front camera" : "Rear camera")
+        .accessibilityHint("Switches between the front and rear cameras")
+        .accessibilityIdentifier("camera.switch")
     }
 }
 
@@ -1636,6 +2121,9 @@ private struct CamcorderCaptureRocker: View {
                 .frame(width: 30, height: 30)
                 .glass(in: Circle())
                 .frame(width: 64, height: 44)
+                // Keep the slow +/- affordances legible without competing
+                // with Record; they become even quieter while operating.
+                .opacity((zooming || slowPressActive) ? 1 : 0.36)
                 .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 0)
             .updating($slowPressActive) { _, active, _ in active = true }
@@ -1746,6 +2234,201 @@ private struct ZoomLauncher: View {
     }
 }
 
+/// The readable capture card that anchors the monitoring HUD. Its collapsed
+/// state reports the active format; a tap opens only device-supported choices
+/// rather than promising modes the active camera cannot use.
+private struct CaptureInfoCard: View {
+    @EnvironmentObject private var camera: CameraController
+    @Binding var isExpanded: Bool
+    let onOpen: () -> Void
+
+    private var freeStorageText: String {
+        let values = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
+        guard let free = values?[.systemFreeSize] as? NSNumber else { return "Storage unavailable" }
+        return ByteCountFormatter.string(fromByteCount: free.int64Value, countStyle: .file) + " free"
+    }
+
+    var body: some View {
+        Button {
+            let opening = !isExpanded
+            isExpanded.toggle()
+            if opening { onOpen() }
+        } label: {
+            VStack(alignment: .leading, spacing: isExpanded ? 14 : 4) {
+                if isExpanded {
+                    expandedHeader
+                    Divider().overlay(InCamTheme.ivory.opacity(0.16))
+                    optionRow(title: "RESOLUTION", values: camera.availableVideoResolutions.map(\.rawValue), selected: camera.videoResolution.rawValue) { value in
+                        if let resolution = VideoResolution(rawValue: value) { camera.setVideoResolution(resolution) }
+                    }
+                    optionRow(title: "FRAME RATE", values: camera.capabilities.frameRates.map { String(format: "%g", $0) }, selected: String(format: "%g", camera.frameRate)) { value in
+                        if let rate = Int(value) { camera.setFrameRate(rate) }
+                    }
+                    optionRow(title: "CODEC", values: camera.availableVideoCodecs.map(\.compactLabel), selected: camera.videoCodec.compactLabel) { value in
+                        if let codec = camera.availableVideoCodecs.first(where: { $0.compactLabel == value }) { camera.setVideoCodec(codec) }
+                    }
+                    optionRow(title: "COLOR SPACE", values: ["SDR", "LOG"], selected: camera.logModeEnabled ? "LOG" : "SDR") { value in
+                        camera.setLogModeEnabled(value == "LOG")
+                    }
+                } else {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("iPhone")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(InCamTheme.ivory.opacity(0.66))
+                            Text(freeStorageText)
+                                .font(.system(size: 19, weight: .bold, design: .rounded))
+                            Text("\(camera.videoResolution.rawValue) · \(String(format: "%g", camera.frameRate)) · \(camera.videoCodec.compactLabel) · \(camera.logModeEnabled ? "LOG" : "SDR")")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(InCamTheme.ivory.opacity(0.62))
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 10)
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.yellow)
+                    }
+                }
+            }
+            .foregroundStyle(InCamTheme.ivory)
+            .padding(isExpanded ? 16 : 12)
+            .frame(width: isExpanded ? 420 : 266, alignment: .leading)
+            .glass(in: RoundedRectangle(cornerRadius: 18, style: .continuous), emphasized: isExpanded)
+        }
+        .buttonStyle(.plain)
+        .disabled(camera.isRecording)
+        .opacity(camera.isRecording ? 0.5 : 1)
+        .accessibilityLabel("Capture format and storage")
+        .accessibilityValue("\(camera.videoResolution.rawValue), \(camera.frameRate) frames per second, \(camera.videoCodec.compactLabel)")
+        .accessibilityHint("Tap to show supported capture choices")
+        .accessibilityIdentifier("capture.monitoringCard")
+    }
+
+    private var expandedHeader: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(freeStorageText)
+                    .font(.system(size: 24, weight: .bold, design: .rounded))
+                Spacer()
+                Label("iPhone", systemImage: "iphone")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(InCamTheme.ivory.opacity(0.7))
+            }
+            GeometryReader { proxy in
+                Capsule().fill(InCamTheme.ivory.opacity(0.18))
+                    .overlay(alignment: .leading) { Capsule().fill(.yellow).frame(width: proxy.size.width * 0.72) }
+            }
+            .frame(height: 5)
+        }
+    }
+
+    private func optionRow(title: String, values: [String], selected: String, choose: @escaping (String) -> Void) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 18) {
+            Text(title).font(.system(size: 8, weight: .medium)).foregroundStyle(InCamTheme.ivory.opacity(0.56)).frame(width: 68, alignment: .leading)
+            ForEach(values, id: \.self) { value in
+                Text(value)
+                    .font(.system(size: 12, weight: value == selected ? .bold : .regular, design: .rounded))
+                    .foregroundStyle(value == selected ? .yellow : InCamTheme.ivory)
+                    .onTapGesture { choose(value) }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+/// The user chooses which one concise status is shown in the former format
+/// tile. This preference survives relaunches without pretending that a time
+/// estimate is accurate before a real active-format bitrate is available.
+private enum CaptureStatusDisplay: String, CaseIterable, Identifiable {
+    case storage
+    case time
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .storage: return "Storage Left"
+        case .time: return "Time Left"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .storage: return "internaldrive"
+        case .time: return "clock"
+        }
+    }
+}
+
+private struct CaptureStatusTile: View {
+    @EnvironmentObject private var camera: CameraController
+    @AppStorage("incam.monitor.status-display") private var selectedRaw = CaptureStatusDisplay.storage.rawValue
+    @State private var freeStorageText = "—"
+    @State private var showsTapFeedback = false
+
+    private var display: CaptureStatusDisplay {
+        CaptureStatusDisplay(rawValue: selectedRaw) ?? .storage
+    }
+
+    private var displayedValue: String {
+        switch display {
+        case .storage: return freeStorageText
+        case .time: return estimatedTimeLeft
+        }
+    }
+
+    /// This is an estimate based on remaining device storage and the selected
+    /// format. The actual duration is ultimately determined by the hardware
+    /// encoder and scene complexity, neither of which is known before record.
+    private var estimatedTimeLeft: String {
+        let values = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
+        guard let free = values?[.systemFreeSize] as? NSNumber else { return "TIME —" }
+        let baseMegabits: Double
+        switch camera.videoResolution {
+        case .p720: baseMegabits = 5
+        case .p1080: baseMegabits = 12
+        case .p4K: baseMegabits = 35
+        }
+        let frameRateFactor = max(0.5, Double(camera.frameRate) / 30)
+        let codecFactor: Double = camera.videoCodec == .hevc ? 0.65 : 1
+        let seconds = Double(truncating: free) * 8 / (baseMegabits * frameRateFactor * codecFactor * 1_000_000)
+        let hours = Int(seconds) / 3_600
+        if hours >= 24 { return "\(hours / 24)d \((hours % 24))h" }
+        if hours >= 1 { return "\(hours)h \((Int(seconds) % 3_600) / 60)m" }
+        return "\(max(1, Int(seconds) / 60))m"
+    }
+
+    private func availableStorage() -> String {
+        let values = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
+        guard let free = values?[.systemFreeSize] as? NSNumber else { return "—" }
+        return ByteCountFormatter.string(fromByteCount: free.int64Value, countStyle: .file)
+    }
+
+    var body: some View {
+        Button {
+            selectedRaw = display == .storage ? CaptureStatusDisplay.time.rawValue : CaptureStatusDisplay.storage.rawValue
+            withAnimation(.easeOut(duration: 0.1)) { showsTapFeedback = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                withAnimation(.easeIn(duration: 0.15)) { showsTapFeedback = false }
+            }
+        } label: {
+            Text(displayedValue)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(InCamTheme.ivory)
+            .lineLimit(1)
+            // Storage/time shares the Audio card's top edge. It is not
+            // vertically centered inside the 34-point Audio rectangle.
+            .frame(height: 34, alignment: .top)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(showsTapFeedback ? 1 : 0.42)
+        .task { freeStorageText = availableStorage() }
+        .accessibilityLabel(display.title)
+        .accessibilityValue(displayedValue)
+        .accessibilityHint("Tap to switch between storage left and estimated recording time")
+    }
+}
+
 /// Small rectangular output controls that live directly below the Audio
 /// meters, matching Ratio and Grid rather than introducing a second shape.
 /// Each control cycles only through values reported by the current camera; an
@@ -1849,8 +2532,15 @@ private struct CaptureFormatToolStack: View {
 private struct CompactAudioInspector: View {
     @EnvironmentObject private var camera: CameraController
     let onClose: () -> Void
+    var usesOwnBackground = true
 
     var body: some View {
+        content
+            .foregroundStyle(InCamTheme.ivory)
+            .accessibilityIdentifier("audio.compactInspector")
+    }
+
+    @ViewBuilder private var content: some View {
         VStack(alignment: .leading, spacing: 6) {
             channelModeSelector
             routeMenu(title: "INPUT", value: selectedInputName, isMuted: false) {
@@ -1869,12 +2559,16 @@ private struct CompactAudioInspector: View {
                     }
                 }
             }
+            // Keep the optional dBFS reference compact and on one trailing
+            // edge instead of rebuilding the vertical meter in this panel.
+            Text("0   −12   −24   −48 dBFS")
+                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                .foregroundStyle(InCamTheme.ivory.opacity(0.48))
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(8)
-        .frame(width: 132, alignment: .leading)
-        .glass(in: RoundedRectangle(cornerRadius: 12, style: .continuous), emphasized: true)
-        .foregroundStyle(InCamTheme.ivory)
-        .accessibilityIdentifier("audio.compactInspector")
+        .frame(width: 178, alignment: .leading)
+        .modifier(AudioInspectorBackground(isVisible: usesOwnBackground))
     }
 
     private var selectedInputName: String {
@@ -1915,6 +2609,373 @@ private struct CompactAudioInspector: View {
             .padding(.horizontal, 7)
             .glass(in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
+    }
+}
+
+/// Familiar digital-audio meter markings. These are dBFS (not dBu or LUFS):
+/// 0 dBFS is the digital ceiling, −6 is close to clipping, and −18 dBFS is a
+/// common production reference. The live bars are the real input channels.
+private struct AudioDecibelScale: View {
+    let height: CGFloat
+    private let marks = ["0", "−6", "−12", "−18", "−24", "−36", "−48", "−60"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(marks, id: \.self) { mark in
+                HStack(spacing: 3) {
+                    Rectangle()
+                        .fill(mark == "0" ? .red : InCamTheme.ivory.opacity(0.28))
+                        .frame(width: mark == "0" ? 9 : 6, height: 1)
+                    Text(mark)
+                        .font(.system(size: 7, weight: mark == "0" ? .bold : .medium, design: .monospaced))
+                        .foregroundStyle(mark == "0" ? .red : InCamTheme.ivory.opacity(0.64))
+                }
+                .frame(maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .frame(height: height)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Audio scale in decibels full scale")
+        .accessibilityValue("0, minus 6, minus 12, minus 18, minus 24, minus 36, minus 48, minus 60")
+    }
+}
+
+/// Resting audio controls are intentionally small. A long press reveals
+/// routing and the full meter, avoiding a panel during ordinary framing.
+private struct AudioMeterLauncher: View {
+    let levels: [Float]
+    let isExpanded: Bool
+    let onLongPress: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if isExpanded {
+                // This card intentionally overflows below its fixed 34-point
+                // layout slot. The rest of the left tool rail stays still.
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(InCamTheme.graphite.opacity(0.90))
+                    .frame(width: 178, height: 154)
+                    .glass(in: RoundedRectangle(cornerRadius: 10, style: .continuous), emphasized: true)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
+            }
+
+            AudioLevelMeters(levels: levels, height: 20, showsChannelLabels: true,
+                             orientation: .horizontal, showsTrackBackground: true,
+                             trackOpacity: 0.38, usesNeutralMeterColor: true)
+                .frame(width: 162)
+                .frame(width: 178, height: 34)
+            if isExpanded {
+                CompactAudioInspector(onClose: onLongPress, usesOwnBackground: false)
+                    .offset(y: 34)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        // Its allocation remains the slim meter. Expanding is an overlay,
+        // not a relayout operation that shifts every control below it.
+        .frame(width: 178, height: 34, alignment: .topLeading)
+        .glass(in: RoundedRectangle(cornerRadius: 10, style: .continuous), emphasized: true)
+        .zIndex(isExpanded ? 20 : 0)
+        .opacity(isExpanded ? 1 : 0.42)
+        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isExpanded)
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .onLongPressGesture(minimumDuration: 0.35) {
+                let feedback = UIImpactFeedbackGenerator(style: .medium)
+                feedback.prepare()
+                feedback.impactOccurred()
+                onLongPress()
+            }
+            .accessibilityLabel("Audio input and meters")
+            .accessibilityHint("Touch and hold to open input, output, and channel settings below this meter")
+            .accessibilityIdentifier("camera.audio")
+            .accessibilityAction(named: "Open audio controls", onLongPress)
+    }
+}
+
+/// Lets the expanded audio controls join their launcher's one continuous glass
+/// rectangle instead of drawing a second card with a visible break.
+private struct AudioInspectorBackground: ViewModifier {
+    let isVisible: Bool
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if isVisible {
+            content.glass(in: RoundedRectangle(cornerRadius: 12, style: .continuous), emphasized: true)
+        } else {
+            content
+        }
+    }
+}
+
+/// Scope display and selection live below the capture-format control. This is
+/// a real, visible monitor rectangle rather than a tiny status icon. Its graph
+/// is drawn from `sceneScopeSamples`, which the controller clears when Off;
+/// it never runs as a hidden per-frame workload.
+private struct SceneScopeTool: View {
+    let mode: SceneScopeMode
+    let redSamples: [Float]
+    let greenSamples: [Float]
+    let blueSamples: [Float]
+    @Binding var isExpanded: Bool
+    @Binding var isCollapsed: Bool
+    @Binding var isFocused: Bool
+    /// `true` means the tap began on the folded circular launcher.
+    let onTap: (Bool) -> Void
+    /// The global location is passed to the picker so its selected row can be
+    /// presented directly beneath the thumb that opened it.
+    let onLongPress: (CGPoint) -> Void
+    @State private var lastTouchLocation: CGPoint?
+
+    private var scopeWidth: CGFloat { isCollapsed ? 48 : (isExpanded ? 360 : 240) }
+    private var scopeHeight: CGFloat { isCollapsed ? 48 : (isExpanded ? 168 : 112) }
+
+    var body: some View {
+        Group {
+            if isCollapsed {
+                // The folded state is intentionally a true circle, not a
+                // small rounded rectangle, so it reads as a launcher.
+                Circle()
+                    .fill(InCamTheme.graphite.opacity(0.92))
+                    .overlay {
+                        Image(systemName: mode == .waveform ? "waveform.path.ecg" : "chart.bar.xaxis")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(mode == .off ? InCamTheme.ivory.opacity(0.58) : .yellow)
+                    }
+                    .overlay(Circle().stroke(.white.opacity(0.18), lineWidth: 1))
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 17, style: .continuous)
+                        .fill(InCamTheme.graphite.opacity(0.86))
+                    scopeGraphic
+                    VStack(spacing: 0) {
+                        HStack(spacing: 4) {
+                            Text(mode.label)
+                                .font(.system(size: isExpanded ? 12 : 9, weight: .medium, design: .rounded))
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: isExpanded ? 11 : 8, weight: .semibold))
+                        }
+                        .padding(.horizontal, isExpanded ? 16 : 10)
+                        .padding(.top, isExpanded ? 13 : 8)
+                        Spacer(minLength: 0)
+                        if mode == .off {
+                            Text("HOLD TO SELECT")
+                                .font(.system(size: isExpanded ? 10 : 7, weight: .bold, design: .rounded))
+                                .foregroundStyle(InCamTheme.ivory.opacity(0.46))
+                                .padding(.bottom, isExpanded ? 16 : 8)
+                        }
+                    }
+                    .foregroundStyle(mode == .off ? InCamTheme.ivory.opacity(0.54) : .yellow)
+                }
+                .glass(in: RoundedRectangle(cornerRadius: 17, style: .continuous), emphasized: mode != .off)
+            }
+        }
+        // One tap grows toward the rail's bottom-right because the parent
+        // keeps the rail's leading/top anchors fixed. The size is 150%.
+        .frame(width: scopeWidth, height: scopeHeight)
+        // The compact visual is circular; a rectangular hit target keeps the
+        // small launcher reliably tappable without changing its appearance.
+        .contentShape(Rectangle())
+        // A quiet monitor stays visible without competing with active
+        // controls; tapping it restores full opacity immediately.
+        .opacity(isFocused ? 1 : 0.42)
+        .animation(.easeOut(duration: 0.12), value: isFocused)
+        .simultaneousGesture(DragGesture(minimumDistance: 0, coordinateSpace: .global)
+            .onChanged { value in lastTouchLocation = value.location })
+        .simultaneousGesture(DragGesture(minimumDistance: 18)
+            .onEnded { value in
+                // A deliberate right-to-left swipe folds the monitor. The
+                // compact circle remains at the same rail origin and can be
+                // tapped to return to the rectangular compact monitor.
+                guard (value.startLocation.x >= scopeWidth * 0.6 || value.startLocation.y <= 28),
+                      value.translation.width < -54,
+                      abs(value.translation.width) > abs(value.translation.height) else { return }
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                    isExpanded = false
+                    isCollapsed = true
+                    isFocused = false
+                }
+            })
+        .gesture(TapGesture().onEnded {
+            let restoringFromCircle = isCollapsed
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                isCollapsed = false
+                isExpanded = false
+            }
+            onTap(restoringFromCircle)
+        })
+        .onLongPressGesture(minimumDuration: 0.35) {
+            // Accessibility and synthesized taps may not supply a drag
+            // location; using the scope's midpoint is a stable fallback.
+            if !isCollapsed {
+                isFocused = true
+                onLongPress(lastTouchLocation ?? CGPoint(x: 0, y: 0))
+            }
+        }
+        .accessibilityLabel("Image scope")
+        .accessibilityValue(mode.label)
+        .accessibilityHint("Touch and hold to select waveform, histogram, or off")
+        .accessibilityIdentifier("sceneScope.choose")
+    }
+
+    @ViewBuilder private var scopeGraphic: some View {
+        Canvas { context, size in
+            let gridColor = Color.white.opacity(0.13)
+            let inset: CGFloat = isExpanded ? 18 : 11
+            let top: CGFloat = isExpanded ? 38 : 25
+            let bottom: CGFloat = isExpanded ? 24 : 12
+            let graph = CGRect(x: inset, y: top, width: size.width - inset * 2, height: size.height - top - bottom)
+            for fraction in stride(from: CGFloat(0), through: 1, by: 0.2) {
+                var horizontal = Path()
+                horizontal.move(to: CGPoint(x: graph.minX, y: graph.minY + graph.height * fraction))
+                horizontal.addLine(to: CGPoint(x: graph.maxX, y: graph.minY + graph.height * fraction))
+                context.stroke(horizontal, with: .color(gridColor), lineWidth: 0.5)
+            }
+            for fraction in stride(from: CGFloat(0), through: 1, by: 0.1) {
+                var vertical = Path()
+                vertical.move(to: CGPoint(x: graph.minX + graph.width * fraction, y: graph.minY))
+                vertical.addLine(to: CGPoint(x: graph.minX + graph.width * fraction, y: graph.maxY))
+                context.stroke(vertical, with: .color(gridColor), style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+            }
+            guard mode != .off, !redSamples.isEmpty else { return }
+            if mode == .histogram {
+                drawHistogram(redSamples, color: .red, in: graph, context: &context)
+                drawHistogram(greenSamples, color: .green, in: graph, context: &context)
+                drawHistogram(blueSamples, color: .blue, in: graph, context: &context)
+            } else {
+                // A waveform is displayed as an RGB parade: each real channel
+                // owns a third of the rectangle, matching video-monitor UI.
+                drawWaveform(redSamples, color: .red, in: graph, band: 0, context: &context)
+                drawWaveform(greenSamples, color: .green, in: graph, band: 1, context: &context)
+                drawWaveform(blueSamples, color: .blue, in: graph, band: 2, context: &context)
+            }
+        }
+        .padding(2)
+    }
+
+    private func drawHistogram(_ samples: [Float], color: Color, in graph: CGRect, context: inout GraphicsContext) {
+        let width = graph.width / CGFloat(max(1, samples.count))
+        var path = Path()
+        for (index, sample) in samples.enumerated() {
+            let x = graph.minX + CGFloat(index) * width
+            let y = graph.maxY - graph.height * CGFloat(sample)
+            index == 0 ? path.move(to: CGPoint(x: x, y: y)) : path.addLine(to: CGPoint(x: x, y: y))
+        }
+        context.stroke(path, with: .color(color.opacity(0.9)), lineWidth: isExpanded ? 1.25 : 0.8)
+    }
+
+    private func drawWaveform(_ samples: [Float], color: Color, in graph: CGRect, band: Int, context: inout GraphicsContext) {
+        let bandWidth = graph.width / 3
+        var path = Path()
+        for (index, sample) in samples.enumerated() {
+            let x = graph.minX + CGFloat(band) * bandWidth + bandWidth * CGFloat(index) / CGFloat(max(1, samples.count - 1))
+            let y = graph.maxY - graph.height * CGFloat(sample)
+            index == 0 ? path.move(to: CGPoint(x: x, y: y)) : path.addLine(to: CGPoint(x: x, y: y))
+        }
+        context.stroke(path, with: .color(color.opacity(0.78)), lineWidth: isExpanded ? 1.05 : 0.75)
+    }
+}
+
+/// Vertical picker shown at the hold location. The active scope deliberately
+/// occupies the middle row, which is the same point as the user's thumb.
+private struct SceneScopeChoiceColumn: View {
+    let selection: SceneScopeMode
+    let onSelect: (SceneScopeMode) -> Void
+
+    private var centeredModes: [SceneScopeMode] {
+        let modes = SceneScopeMode.allCases
+        guard let index = modes.firstIndex(of: selection) else { return modes }
+        return [modes[(index + modes.count - 1) % modes.count],
+                selection,
+                modes[(index + 1) % modes.count]]
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ForEach(centeredModes) { mode in
+                Button { onSelect(mode) } label: {
+                    Text(mode.compactLabel)
+                        .font(.system(size: 8, weight: .bold, design: .rounded))
+                        .foregroundStyle(mode == selection ? .yellow : InCamTheme.ivory.opacity(0.66))
+                        .frame(width: 72, height: 30)
+                        .glass(in: RoundedRectangle(cornerRadius: 10, style: .continuous), emphasized: mode == selection)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(mode.label)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .simultaneousGesture(DragGesture(minimumDistance: 12)
+            .onEnded { value in
+                guard abs(value.translation.height) > abs(value.translation.width) else { return }
+                let modes = SceneScopeMode.allCases
+                guard let current = modes.firstIndex(of: selection) else { return }
+                // Swiping down advances through the monitor modes; swiping up
+                // reverses it. The re-render recenters the new selection.
+                let direction = value.translation.height > 0 ? 1 : -1
+                onSelect(modes[(current + direction + modes.count) % modes.count])
+            })
+        .accessibilityIdentifier("sceneScope.options")
+    }
+}
+
+/// Opens the saved-profile tray without changing camera capture rendering.
+/// Holding it opens the independent reference-image Color workspace.
+private struct ColorWorkspaceLauncher: View {
+    let diameter: CGFloat
+    let isExpanded: Bool
+    let onTap: () -> Void
+    let onOpenWorkspace: () -> Void
+    @State private var suppressTap = false
+
+    var body: some View {
+        Button {
+            if suppressTap {
+                suppressTap = false
+            } else {
+                onTap()
+            }
+        } label: {
+            Circle()
+                .fill(AngularGradient(colors: [.red, .purple, .blue, .cyan, .green, .yellow, .red], center: .center))
+                .overlay(Circle().fill(.black).padding(diameter * 0.16))
+                .overlay(Circle().stroke(isExpanded ? .yellow : .white.opacity(0.78), lineWidth: isExpanded ? 2 : 1.25))
+                .padding(3)
+                .background(.black.opacity(0.34), in: Circle())
+                .frame(width: diameter, height: diameter)
+        }
+        .buttonStyle(.plain)
+        .simultaneousGesture(LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+            suppressTap = true
+            onOpenWorkspace()
+        })
+        .accessibilityLabel("Color profiles")
+        .accessibilityHint("Tap to open the profile tray. Touch and hold to edit a reference image.")
+        .accessibilityIdentifier("cameraColors.workspaceLauncher")
+    }
+}
+
+private struct ColorProfileTray: View {
+    let onOpenWorkspace: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("PROFILES")
+                .font(.system(size: 8, weight: .bold, design: .rounded))
+                .foregroundStyle(.yellow)
+            Button("EDIT") { onOpenWorkspace() }
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundStyle(InCamTheme.ivory)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 20, height: 24)
+            }
+            .foregroundStyle(InCamTheme.ivory.opacity(0.72))
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 42)
+        .glass(in: Capsule(), emphasized: true)
+        .accessibilityIdentifier("cameraColors.profileTray")
     }
 }
 

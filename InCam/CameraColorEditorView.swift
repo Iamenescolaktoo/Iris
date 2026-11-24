@@ -2,10 +2,14 @@ import PhotosUI
 import SwiftUI
 import UIKit
 
+// FILE GUIDE: Full-screen reference-image editor for Custom Color recipes.
+// It handles the editing UI and gestures; the recipe model/rendering lives in
+// CameraColorModels.swift. This editor is on-demand and is not camera startup.
+
 private enum EditorStage: String, CaseIterable, Identifiable {
-    case process = "Process"
-    case hsl = "HSL"
-    case film = "Film Look"
+    case process = "Levels"
+    case hsl = "Colors"
+    case film = "Texture"
     var id: String { rawValue }
 }
 
@@ -34,6 +38,9 @@ private enum GestureAxis {
     case vertical
 }
 
+/// Full-screen reference-image workspace for building a saved color recipe.
+/// It is deliberately separate from the camera preview: its changes remain
+/// recipe data and do not claim to alter live or recorded footage.
 struct CameraColorEditorView: View {
     @EnvironmentObject private var colors: CameraColorStore
     @Environment(\.dismiss) private var dismiss
@@ -50,114 +57,111 @@ struct CameraColorEditorView: View {
     @State private var before = false
     @State private var photoItem: PhotosPickerItem?
     @State private var photoData: Data?
+    @State private var showCameraPicker = false
     @State private var showSave = false
     @State private var gestureStartAmount: Double?
     @State private var gestureStartParameter = 0
+    @State private var valueRulerVisible = false
+    @State private var parameterMenuVisible = false
 
-    init(recipe: CameraColorRecipe, sourceSlot: Int?) {
+    init(recipe: CameraColorRecipe, sourceSlot: Int?, initialPhotoData: Data? = nil) {
         _recipe = State(initialValue: recipe)
+        _photoData = State(initialValue: initialPhotoData)
         self.sourceSlot = sourceSlot
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            editorHeader
-            photo
-                .padding(.horizontal, 12)
-                .padding(.top, 6)
+        GeometryReader { proxy in
+            let contentHeight = max(1, proxy.size.height - proxy.safeAreaInsets.top - proxy.safeAreaInsets.bottom)
+            let imageHeight = max(180, contentHeight * 0.62)
+            VStack(spacing: 0) {
+                editorHeader
+                    .padding(.horizontal, 14)
+                    .padding(.top, proxy.safeAreaInsets.top)
 
-            if stage == .hsl { hslSwatches.padding(.top, 10) }
+                HStack(alignment: .center, spacing: 14) {
+                    photo
+                        .frame(maxWidth: .infinity)
+                        .frame(height: imageHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
-            VStack(spacing: 7) {
-                Text(parameter.rawValue.uppercased())
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(InCamTheme.ivory.opacity(0.7))
-                Text(amountLabel)
-                    .font(.system(size: 22, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                PrecisionRuler(value: amountBinding, range: amountRange, step: amountStep) { formatAmount($0) }
-                    .frame(height: 55)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 8)
-
-            stageNavigation
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
-
-            HStack(spacing: 12) {
-                Button { before.toggle() } label: {
-                    Label(before ? "Before" : "After", systemImage: "rectangle.lefthalf.inset.filled")
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .glass(in: Capsule(), emphasized: before)
+                    colorPalette
+                        .frame(width: 48, height: imageHeight)
                 }
+                .padding(.horizontal, 18)
+                .padding(.top, 4)
+
+                colorControls
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+                    .padding(.bottom, max(10, proxy.safeAreaInsets.bottom))
             }
-            .font(.system(size: 12, weight: .semibold, design: .rounded))
-            .padding(16)
         }
-        .background(InCamTheme.graphite.ignoresSafeArea())
+        .background(Color.black.ignoresSafeArea())
         .foregroundStyle(InCamTheme.ivory)
         .navigationBarBackButtonHidden()
         .toolbar(.hidden, for: .navigationBar)
-        .onAppear { OrientationRequest.portrait() }
+        .onAppear { OrientationRequest.landscape() }
         .onChange(of: photoItem) { _, item in load(item) }
+        .sheet(isPresented: $showCameraPicker) {
+            CameraColorImagePicker { image in
+                photoData = image.jpegData(compressionQuality: 0.94)
+            }
+        }
         .sheet(isPresented: $showSave) {
-            SaveCameraColorView(recipe: recipe, initialSlot: sourceSlot) { dismiss() }
+            SaveCameraColorView(recipe: recipe, initialSlot: sourceSlot,
+                                previewPhoto: photoData.flatMap(UIImage.init(data:))) { dismiss() }
         }
     }
 
     private var editorHeader: some View {
-        HStack {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.left").frame(width: 44, height: 44)
+        ZStack {
+            HStack {
+                Menu {
+                    PhotosPicker(selection: $photoItem, matching: .images) { Label("Upload image", systemImage: "photo") }
+                    Button { showCameraPicker = true } label: { Label("Capture image", systemImage: "camera") }
+                } label: {
+                    Image(systemName: "photo.badge.plus").frame(width: 44, height: 44)
+                }
+                .menuStyle(.borderlessButton)
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Discard color edits")
             }
-            Spacer()
-            Text("Camera Colors").font(.system(size: 17, weight: .semibold, design: .rounded))
-            Spacer()
-            Button("Save") { showSave = true }
-                .font(.system(size: 14, weight: .bold, design: .rounded))
-                .frame(width: 54, height: 44)
+            Button { showSave = true } label: {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 17, weight: .bold))
+                    .frame(width: 52, height: 44)
+                    .glass(in: Capsule(), emphasized: true)
+            }
+            .accessibilityLabel("Save color profile")
         }
-        .padding(.horizontal, 4)
+        .font(.system(size: 17, weight: .semibold, design: .rounded))
     }
 
     private var photo: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 18)
-                .fill(LinearGradient(colors: [Color(red: 0.42, green: 0.28, blue: 0.18),
-                                               Color(red: 0.08, green: 0.13, blue: 0.16), .black],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing))
             if let image = displayedImage {
                 Image(uiImage: image)
                     .resizable()
-                    .scaledToFit()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
             } else {
-                Image(systemName: "mountain.2.fill")
-                    .resizable().scaledToFit()
-                    .frame(width: 150)
-                    .foregroundStyle(.white.opacity(0.42))
+                LinearGradient(colors: [Color(red: 0.22, green: 0.19, blue: 0.16), InCamTheme.graphite],
+                               startPoint: .topLeading, endPoint: .bottomTrailing)
+                VStack(spacing: 16) {
+                    Image(systemName: "photo.badge.plus")
+                        .font(.system(size: 40, weight: .light))
+                    Text("Choose an image to build a color profile")
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                }
+                .foregroundStyle(InCamTheme.ivory.opacity(0.82))
             }
-            if showAffectedColor {
-                selectedBand.color.opacity(0.24)
-                    .blendMode(.plusLighter)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
-            }
-            if parameterSelectionVisible { parameterSelectionIndicator }
-
-            PhotosPicker(selection: $photoItem, matching: .images) {
-                Label(displayedImage == nil ? "Select Image" : "Change Image", systemImage: "photo.on.rectangle")
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .padding(.horizontal, 14)
-                    .frame(height: 38)
-                    .glass(in: Capsule(), emphasized: true)
-            }
-            .accessibilityIdentifier("cameraColors.imageSelector")
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-            .padding(12)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.12), lineWidth: 0.7))
-        .aspectRatio(4 / 3, contentMode: .fit)
         .contentShape(Rectangle())
         .gesture(editorGesture)
     }
@@ -169,6 +173,66 @@ struct CameraColorEditorView: View {
             .padding(.horizontal, 16).padding(.vertical, 11)
         .glass(in: RoundedRectangle(cornerRadius: 18), emphasized: true)
         .transition(.opacity.combined(with: .scale(scale: 0.94)))
+    }
+
+    /// Values stay out of the way until a horizontal edit drag begins. This
+    /// is a visual position indicator; the drag on the full-screen image is
+    /// the sole value-adjustment surface.
+    private var valueRulerHUD: some View {
+        VStack(spacing: 7) {
+            Text(parameter.rawValue.uppercased())
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(InCamTheme.ivory.opacity(0.7))
+            Text(amountLabel)
+                .font(.system(size: 24, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            GeometryReader { proxy in
+                let progress = (amountBinding.wrappedValue - amountRange.lowerBound) /
+                    max(0.0001, amountRange.upperBound - amountRange.lowerBound)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.white.opacity(0.24)).frame(height: 3)
+                    Circle().fill(InCamTheme.ivory).frame(width: 12, height: 12)
+                        .offset(x: max(0, min(proxy.size.width - 12, proxy.size.width * CGFloat(progress) - 6)))
+                }
+            }
+            .frame(width: 168, height: 12)
+        }
+        .padding(.horizontal, 18).padding(.vertical, 12)
+        .glass(in: RoundedRectangle(cornerRadius: 18), emphasized: true)
+        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+    }
+
+    private var holdForBefore: some View {
+        Label(before ? "BEFORE" : "Hold for Before", systemImage: "hand.tap")
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(InCamTheme.ivory)
+            .padding(.horizontal, 16)
+            .frame(height: 38)
+            .glass(in: Capsule(), emphasized: before)
+            .contentShape(Capsule())
+            .onLongPressGesture(minimumDuration: 0, maximumDistance: .infinity,
+                                pressing: { holding in before = holding }, perform: {})
+            .accessibilityLabel("Hold to compare before edits")
+    }
+
+    /// The reference takes roughly five-eighths of the workspace height. The
+    /// compact lower rail only opens a parameter list after a deliberate
+    /// upward swipe, leaving the image visible while values are adjusted.
+    private var colorControls: some View {
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 10) {
+                stageNavigation
+                Spacer(minLength: 0)
+                adjustmentRuler
+                holdForBefore
+            }
+
+            if parameterMenuVisible {
+                parameterMenu
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .zIndex(2)
+            }
+        }
     }
 
     private var editorGesture: some Gesture {
@@ -184,14 +248,14 @@ struct CameraColorEditorView: View {
                 switch gestureAxis {
                 case .horizontal:
                     parameterSelectionVisible = false
-                    showAffectedColor = false
+                    parameterMenuVisible = false
+                    valueRulerVisible = true
                     amountBinding.wrappedValue = min(amountRange.upperBound, max(amountRange.lowerBound,
                         (gestureStartAmount ?? 0) + Double(value.translation.width) * amountStep / 5))
                 case .vertical:
-                    parameterSelectionVisible = true
-                    let index = max(0, min(parameters.count - 1,
-                        gestureStartParameter + Int((-value.translation.height / 42).rounded())))
-                    parameter = parameters[index]
+                    // A small upward swipe opens a stable list. It does not
+                    // rotate parameters underneath the user's finger.
+                    if value.translation.height < -18 { parameterMenuVisible = true }
                 case nil:
                     break
                 }
@@ -200,29 +264,53 @@ struct CameraColorEditorView: View {
                 gestureStartAmount = nil
                 gestureStartParameter = parameters.firstIndex(of: parameter) ?? 0
                 gestureAxis = nil
-                withAnimation(.easeOut(duration: 0.16)) { parameterSelectionVisible = false }
+                withAnimation(.easeOut(duration: 0.16)) {
+                    parameterSelectionVisible = false
+                    valueRulerVisible = false
+                }
             }
     }
 
     private var hslSwatches: some View {
-        HStack(spacing: 9) {
+        VStack(spacing: 10) {
             ForEach(HSLBand.allCases) { band in
                 Button {
                     selectedBand = band
                     showAffectedColor = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { showAffectedColor = false }
+                    // Isolation is deliberately brief: it identifies the
+                    // affected spectrum, then restores the real full-color
+                    // reference so the person can continue grading.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) {
+                        guard selectedBand == band else { return }
+                        withAnimation(.easeOut(duration: 0.16)) { showAffectedColor = false }
+                    }
                 } label: {
                     Circle().fill(band.color)
-                        .frame(width: band == selectedBand ? 28 : 23, height: band == selectedBand ? 28 : 23)
+                        .frame(width: band == selectedBand ? 34 : 25, height: band == selectedBand ? 34 : 25)
                         .overlay(Circle().stroke(InCamTheme.ivory, lineWidth: band == selectedBand ? 2 : 0))
+                        .shadow(color: band == selectedBand ? band.color : .clear, radius: 8)
                 }
-            }
-            Button { showAffectedColor.toggle() } label: {
-                Image(systemName: showAffectedColor ? "eye.fill" : "eye")
-                    .frame(width: 30, height: 30)
             }
         }
         .buttonStyle(PressScaleStyle())
+        .accessibilityLabel("Color range palette")
+    }
+
+    /// The vertical palette follows the reference editor: only Colors exposes
+    /// spectrum choices, so Levels and Texture have no competing color rail.
+    @ViewBuilder private var colorPalette: some View {
+        if stage == .hsl {
+            hslSwatches
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: stage == .process ? "chart.line.uptrend.xyaxis" : "circle.lefthalf.filled")
+                    .font(.system(size: 17, weight: .medium))
+                Text(stage == .process ? "LEVELS" : "TEXTURE")
+                    .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .multilineTextAlignment(.center)
+            }
+            .foregroundStyle(InCamTheme.ivory.opacity(0.58))
+        }
     }
 
     private var stageNavigation: some View {
@@ -232,6 +320,7 @@ struct CameraColorEditorView: View {
                     stage = item
                     parameter = parameters(for: item).first!
                     parameterSelectionVisible = false
+                    parameterMenuVisible = false
                 } label: {
                     Text(item.rawValue)
                         .font(.system(size: 12, weight: stage == item ? .bold : .medium, design: .rounded))
@@ -245,6 +334,75 @@ struct CameraColorEditorView: View {
         .glass(in: Capsule())
     }
 
+    /// A centered ruler makes zero physically stable. Horizontal travel adjusts
+    /// the active value; an upward swipe reveals the remaining English controls.
+    private var adjustmentRuler: some View {
+        GeometryReader { proxy in
+            let center = proxy.size.width / 2
+            ZStack {
+                HStack(spacing: 5) {
+                    ForEach(0..<45, id: \.self) { index in
+                        Capsule()
+                            .fill(InCamTheme.ivory.opacity(index % 5 == 0 ? 0.52 : 0.26))
+                            .frame(width: 2, height: index % 5 == 0 ? 19 : 11)
+                    }
+                }
+                Rectangle()
+                    .fill(.yellow)
+                    .frame(width: 2, height: 31)
+                    .position(x: center, y: proxy.size.height / 2)
+                VStack(spacing: 2) {
+                    Text(parameter.rawValue.uppercased())
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundStyle(InCamTheme.ivory.opacity(0.68))
+                    Text(amountLabel)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(.black.opacity(0.50), in: Capsule())
+                .offset(y: -31)
+            }
+            .contentShape(Rectangle())
+            .gesture(editorGesture)
+        }
+        .frame(height: 58)
+        .accessibilityLabel("\(parameter.rawValue) adjustment ruler")
+        .accessibilityValue(amountLabel)
+        .accessibilityHint("Swipe left or right to adjust. Swipe up to choose another control.")
+    }
+
+    /// The options dim rather than cover the image controls. Selecting one
+    /// closes this list and returns to the centered neutral ruler.
+    private var parameterMenu: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(parameters) { item in
+                Button {
+                    parameter = item
+                    withAnimation(.easeOut(duration: 0.16)) { parameterMenuVisible = false }
+                } label: {
+                    HStack {
+                        Text(item.rawValue)
+                        Spacer()
+                        if parameter == item { Image(systemName: "checkmark") }
+                    }
+                    .font(.system(size: 15, weight: parameter == item ? .bold : .medium, design: .rounded))
+                    .foregroundStyle(parameter == item ? .black : InCamTheme.ivory)
+                    .padding(.horizontal, 18)
+                    .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                    .background(parameter == item ? Color.yellow : .clear)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(maxWidth: 360)
+        .background(.black.opacity(0.88), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(.white.opacity(0.20), lineWidth: 1))
+        .shadow(color: .black.opacity(0.5), radius: 20, y: 7)
+        .padding(.bottom, 4)
+    }
+
     private var parameters: [EditorParameter] { parameters(for: stage) }
     private func parameters(for stage: EditorStage) -> [EditorParameter] {
         switch stage {
@@ -255,7 +413,9 @@ struct CameraColorEditorView: View {
     }
 
     private var amountRange: ClosedRange<Double> {
-        parameter == .pattern ? 0...2 : -1...1
+        if parameter == .pattern { return 0...2 }
+        if parameter == .threshold { return 0...1 }
+        return -1...1
     }
     private var amountStep: Double { parameter == .pattern ? 1 : 0.01 }
     private var amountLabel: String { formatAmount(amountBinding.wrappedValue) }
@@ -319,11 +479,118 @@ struct CameraColorEditorView: View {
     }
 
     private var displayedImage: UIImage? {
+        // PERFORMANCE NOTE: this builds a Core Image preview from the chosen
+        // reference photo. It only runs when Camera Colors is open, but can be
+        // re-evaluated during a drag. Cache a scaled background-rendered preview
+        // later if this editor stutters; it does not delay cold camera startup.
         guard let photoData, let source = UIImage(data: photoData) else { return nil }
         guard !before, let ci = CIImage(image: source) else { return source }
-        let rendered = RecipeRenderer.render(ci, recipe: recipe)
+        var rendered = RecipeRenderer.render(ci, recipe: recipe)
+        if stage == .hsl, showAffectedColor {
+            let hsl = recipe.hsl[selectedBand] ?? HSLAdjustment()
+            rendered = RecipeRenderer.isolate(rendered, band: selectedBand, range: hsl.range, falloff: hsl.falloff)
+        }
         guard let cg = RecipeRenderer.context.createCGImage(rendered, from: rendered.extent) else { return source }
         return UIImage(cgImage: cg, scale: source.scale, orientation: source.imageOrientation)
+    }
+}
+
+/// The first Camera Colors screen is intentionally only a source choice.
+/// Editing starts once the person has supplied an image, avoiding a screen
+/// full of color controls with no visual reference.
+/// PAUSED FEATURE: The upload/capture gateway remains available in source but
+/// is not reachable while `AppFeatureAvailability.cameraColorsEditor` is false.
+struct CameraColorSourceView: View {
+    @State private var photoItem: PhotosPickerItem?
+    @State private var photoData: Data?
+    @State private var showCameraPicker = false
+    @State private var openEditor = false
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            Image(systemName: "camera.filters")
+                .font(.system(size: 48, weight: .light))
+                .foregroundStyle(InCamTheme.ivory)
+            Text("Create a Color Profile")
+                .font(.system(size: 23, weight: .bold, design: .rounded))
+            Text("Start with a reference image. Your profile controls appear after you choose one.")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 300)
+
+            VStack(spacing: 10) {
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    Label("Upload Image", systemImage: "photo.on.rectangle")
+                        .frame(maxWidth: .infinity, minHeight: 52)
+                        .glass(in: RoundedRectangle(cornerRadius: 16), emphasized: true)
+                }
+                Button { showCameraPicker = true } label: {
+                    Label("Capture Image", systemImage: "camera")
+                        .frame(maxWidth: .infinity, minHeight: 52)
+                        .glass(in: RoundedRectangle(cornerRadius: 16))
+                }
+            }
+            .font(.system(size: 15, weight: .bold, design: .rounded))
+            .padding(.horizontal, 24)
+
+            NavigationLink("Saved Profiles") { CameraColorLibraryView() }
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(InCamTheme.ivory.opacity(0.72))
+            Spacer()
+        }
+        .padding()
+        .background(InCamTheme.graphite.ignoresSafeArea())
+        .foregroundStyle(InCamTheme.ivory)
+        .navigationDestination(isPresented: $openEditor) {
+            CameraColorEditorView(recipe: CameraColorRecipe(name: "New Color Profile"),
+                                  sourceSlot: nil, initialPhotoData: photoData)
+        }
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                await MainActor.run {
+                    photoData = data
+                    openEditor = true
+                }
+            }
+        }
+        .sheet(isPresented: $showCameraPicker) {
+            CameraColorImagePicker { image in
+                photoData = image.jpegData(compressionQuality: 0.94)
+                openEditor = photoData != nil
+            }
+        }
+    }
+}
+
+struct CameraColorImagePicker: UIViewControllerRepresentable {
+    let onImage: (UIImage) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera) ? .camera : .photoLibrary
+        picker.delegate = context.coordinator
+        picker.allowsEditing = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let parent: CameraColorImagePicker
+        init(parent: CameraColorImagePicker) { self.parent = parent }
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) { parent.dismiss() }
+        func imagePickerController(_ picker: UIImagePickerController,
+                                   didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            if let image = info[.originalImage] as? UIImage { parent.onImage(image) }
+            parent.dismiss()
+        }
     }
 }
 
@@ -398,6 +665,13 @@ private struct SaveCameraColorView: View {
 }
 
 private enum OrientationRequest {
+    /// The color workspace mirrors the landscape camera layout so the large
+    /// reference image, right-side palette, and lower ruler fit together.
+    static func landscape() {
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
+    }
+
     static func portrait() {
         guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
@@ -420,12 +694,18 @@ final class ColorDockControls: ObservableObject {
             }
         }
     }
-    @Published var selection = "Clarity"
+    /// Defaults to Color Mix while the basic color controls are intentionally paused.
+    @Published var selection = AppFeatureAvailability.basicColorControls ? "Clarity" : "Color Mix"
     @Published var band = HSLBand.yellow
     @Published var axis = "Hue"
     // Camera Colors now owns saved color modes directly. The old CC page
     // remains in the data model for compatibility but is no longer a route.
-    let sections = ["Clarity", "Saturation", "Contrast", "Color Mix"]
+    /// Source still supports the complete dock; only the current visible set changes.
+    var sections: [String] {
+        AppFeatureAvailability.basicColorControls
+            ? ["Clarity", "Saturation", "Contrast", "Color Mix"]
+            : ["Color Mix"]
+    }
     @Published var loadedCustomSlot: Int?
     /// Camera Colors can be active without opening its detailed mixer. This
     /// makes the dock a direct mode selector during normal shooting.
@@ -607,7 +887,12 @@ struct CameraColorDock: View {
     @Binding var expanded: Bool
     @State private var showPresetPicker = false
     @State private var colorLongPressTriggered = false
-    private let sections = ["Clarity", "Saturation", "Contrast", "Color Mix"]
+    /// Keep Color Mix reachable while the three quick recipe controls are paused.
+    private var sections: [String] {
+        AppFeatureAvailability.basicColorControls
+            ? ["Clarity", "Saturation", "Contrast", "Color Mix"]
+            : ["Color Mix"]
+    }
 
     private var highlightedSection: String {
         controls.selection == "Custom Colors" ? "Color Mix" : controls.selection

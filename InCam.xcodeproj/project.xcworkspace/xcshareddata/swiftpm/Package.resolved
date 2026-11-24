@@ -1,0 +1,15 @@
+{
+  "originHash" : "c08c313e927b570eb5d074d86764d459dccd93c5fbc422d0b6e21c3bb213caef",
+  "pins" : [
+    {
+      "identity" : "raster",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/aldealabs/raster.git",
+      "state" : {
+        "revision" : "f432946ebc57e2c4928e72d169f062a3fa5efd22",
+        "version" : "1.26.0"
+      }
+    }
+  ],
+  "version" : 3
+}

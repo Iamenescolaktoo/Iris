@@ -2,6 +2,10 @@ import CoreGraphics
 import Combine
 import Foundation
 
+// FILE GUIDE: Small shared data types and persistent preference stores used by
+// camera, Settings and Gallery. These models describe choices; the controller
+// validates and applies any choice that touches real camera hardware.
+
 enum CaptureMode: String, CaseIterable, Codable {
     case photo
     case video
@@ -44,6 +48,33 @@ enum VideoCodec: String, CaseIterable, Codable, Identifiable {
         case .proRes422LT: return "PR LT"
         case .proRes422: return "PR 422"
         case .proRes422HQ: return "PR HQ"
+        }
+    }
+}
+
+/// The optional on-camera video analyser. It is deliberately independent of
+/// composition guides: Grid and Level help frame a shot, while these scopes
+/// inspect the incoming image only when the person explicitly turns one on.
+enum SceneScopeMode: String, CaseIterable, Codable, Identifiable {
+    case off
+    case waveform
+    case histogram
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off: return "OFF"
+        case .waveform: return "WAVEFORM"
+        case .histogram: return "HISTOGRAM"
+        }
+    }
+
+    var compactLabel: String {
+        switch self {
+        case .off: return "OFF"
+        case .waveform: return "WFM"
+        case .histogram: return "HIST"
         }
     }
 }
@@ -137,6 +168,17 @@ enum CameraExposureDefaults {
         11.25, 22.5, 45, 72, 90, 120, 135, 144, 172.8, 180,
         225, 240, 270, 288, 360
     ]
+
+    static func closestShutterAngle(_ value: Double) -> Double {
+        shutterAngleDegrees.min(by: { abs($0 - value) < abs($1 - value) }) ?? 180
+    }
+
+    static func shutterAngleLabel(_ degrees: Double) -> String {
+        let rounded = degrees.rounded()
+        if abs(degrees - rounded) < 0.001 { return "\(Int(rounded))°" }
+        return String(format: "%.2f°", degrees)
+            .replacingOccurrences(of: "0°", with: "°")
+    }
 
     /// One canonical display candidate is shared by the compact readout and
     /// its ruler. Auto may meter a non-standard duration such as 1/47, but
@@ -315,9 +357,8 @@ final class CameraScreenPreferences: ObservableObject {
     @Published var showCustom2: Bool { didSet { defaults.set(showCustom2, forKey: "incam.screen.c2") } }
     @Published var showMainControls: Bool { didSet { defaults.set(showMainControls, forKey: "incam.screen.controls") } }
     @Published var showQuickRow: Bool { didSet { defaults.set(showQuickRow, forKey: "incam.screen.quickRow") } }
-    /// Guides stay non-destructive by default. This opt-in asks the capture
-    /// pipeline to center-crop the private and Photos copies to the selected
-    /// guide after capture.
+    /// The selected guide is the saved output framing. The capture pipeline
+    /// center-crops private and Photos copies after capture to that ratio.
     @Published var saveFramedOutput: Bool { didSet { defaults.set(saveFramedOutput, forKey: "incam.screen.save-framed-output") } }
     var framingGuide: Bool { !ratioShortcuts.isEmpty }
     @Published var selectedRatio: CompositionRatio { didSet { defaults.set(selectedRatio.rawValue, forKey: "incam.screen.ratio") } }
@@ -332,7 +373,10 @@ final class CameraScreenPreferences: ObservableObject {
         showCustom2 = defaults.bool(forKey: "incam.screen.c2")
         showMainControls = defaults.object(forKey: "incam.screen.controls") as? Bool ?? true
         showQuickRow = defaults.object(forKey: "incam.screen.quickRow") as? Bool ?? true
-        saveFramedOutput = defaults.bool(forKey: "incam.screen.save-framed-output")
+        // Selected composition ratios are output ratios. Force this stored
+        // preference on so older installs cannot silently save the full frame.
+        saveFramedOutput = true
+        defaults.set(true, forKey: "incam.screen.save-framed-output")
         selectedRatio = CompositionRatio(rawValue: defaults.string(forKey: "incam.screen.ratio") ?? "") ?? .fourThree
         let saved = (defaults.stringArray(forKey: "incam.screen.ratios") ?? []).compactMap(CompositionRatio.init(rawValue:))
         ratioShortcuts = defaults.object(forKey: "incam.screen.ratios") == nil ? [.fourThree, .sixteenNine, .square] : saved.reduce(into: []) { if !$0.contains($1) { $0.append($1) } }

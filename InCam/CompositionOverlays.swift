@@ -1,11 +1,21 @@
 import SwiftUI
 
+// FILE GUIDE: Pure SwiftUI geometry and drawing for ratio guides, grids and
+// the level indicator. These overlays do not own capture hardware or crop a
+// preview by themselves.
+
 enum PreviewLayout {
-    static func frame(in size: CGSize, ratio: CompositionRatio, portrait: Bool, safeLeft: CGFloat = 0, safeRight: CGFloat = 0, adjustmentExpanded: Bool = false, rightControls: CGFloat = 100) -> CGRect {
+    static func frame(in size: CGSize, ratio: CompositionRatio, portrait: Bool, safeLeft: CGFloat = 0, safeRight: CGFloat = 0, adjustmentExpanded: Bool = false, rightControls: CGFloat = 100, leadingNotch: CGFloat = 0) -> CGRect {
         // The grey thumb-control strip is fixed. The preview may never claim
         // that space, even when a dock or inspector is expanded.
         let bounds = portrait ? CGRect(origin: .zero, size: size)
-            : CGRect(x: 0, y: 0, width: max(1, size.width - rightControls), height: size.height)
+            // The leading black notch and right mousepad are both outside of
+            // the camera viewport. Keeping this one rectangle authoritative
+            // prevents live pixels, guides, or hit targets from slipping
+            // beneath either surface as the landscape layout is adjusted.
+            : CGRect(x: leadingNotch, y: 0,
+                     width: max(1, size.width - leadingNotch - rightControls),
+                     height: size.height)
         return CGRect(x: bounds.minX, y: 0, width: bounds.width, height: size.height)
     }
 }
@@ -15,6 +25,7 @@ struct CompositionOverlay: View {
     var safeRight: CGFloat = 0
     var adjustmentExpanded = false
     var rightControls: CGFloat = 100
+    var leadingNotch: CGFloat = 0
     var framingEnabled = true
     // Keep the viewport geometry and border available without displaying it.
     var viewportOutlineVisible = false
@@ -37,7 +48,7 @@ struct CompositionOverlay: View {
     var body: some View {
         GeometryReader { proxy in
             let viewport = PreviewLayout.frame(in: proxy.size, ratio: ratio, portrait: isPortrait, safeLeft: safeLeft, safeRight: safeRight,
-                                               adjustmentExpanded: adjustmentExpanded, rightControls: rightControls)
+                                               adjustmentExpanded: adjustmentExpanded, rightControls: rightControls, leadingNotch: leadingNotch)
             let frame = fillsViewport ? viewport : guideFrame(in: proxy.size)
             ZStack {
                 if framingEnabled && !fillsViewport {
@@ -106,7 +117,7 @@ struct CompositionOverlay: View {
 
     private func guideFrame(in size: CGSize) -> CGRect {
         let viewport = PreviewLayout.frame(in: size, ratio: ratio, portrait: isPortrait, safeLeft: safeLeft, safeRight: safeRight,
-                            adjustmentExpanded: adjustmentExpanded, rightControls: rightControls)
+                            adjustmentExpanded: adjustmentExpanded, rightControls: rightControls, leadingNotch: leadingNotch)
         guard framingEnabled else { return viewport }
         let aspect = isPortrait ? 1 / ratio.value : ratio.value
         let width = min(viewport.width, viewport.height * aspect)

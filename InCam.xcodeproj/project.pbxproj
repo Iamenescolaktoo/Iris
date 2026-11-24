@@ -21,6 +21,12 @@
 		B0000000000000000000000C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000C /* SettingsView.swift */; };
 		B0000000000000000000000D /* CameraColorEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000D /* CameraColorEditorView.swift */; };
 		B0000000000000000000000F /* CameraOrientation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000F /* CameraOrientation.swift */; };
+		B00000000000000000000012 /* AppFeatureAvailability.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000012 /* AppFeatureAvailability.swift */; };
+		B00000000000000000000013 /* CameraColorProfileDock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000013 /* CameraColorProfileDock.swift */; };
+		B00000000000000000000014 /* ColorProfileDummy.png in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000014 /* ColorProfileDummy.png */; };
+		B00000000000000000000015 /* ColorCheckerReference.jpg in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000015 /* ColorCheckerReference.jpg */; };
+		B00000000000000000000016 /* MetalPetal in Frameworks */ = {isa = PBXBuildFile; productRef = G00000000000000000000001 /* MetalPetal */; };
+		B00000000000000000000017 /* FocusPeaking.metal in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000016 /* FocusPeaking.metal */; };
 		B00000000000000000000010 /* InCamUITests/CameraWorkflowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000010 /* InCamUITests/CameraWorkflowTests.swift */; };
 /* End PBXBuildFile section */
 
@@ -50,6 +56,11 @@
 		A0000000000000000000000D /* CameraColorEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraColorEditorView.swift; sourceTree = "<group>"; };
 		A0000000000000000000000E /* InCam.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = InCam.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A0000000000000000000000F /* CameraOrientation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraOrientation.swift; sourceTree = "<group>"; };
+		A00000000000000000000012 /* AppFeatureAvailability.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppFeatureAvailability.swift; sourceTree = "<group>"; };
+		A00000000000000000000013 /* CameraColorProfileDock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraColorProfileDock.swift; sourceTree = "<group>"; };
+		A00000000000000000000014 /* ColorProfileDummy.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = ColorProfileDummy.png; sourceTree = "<group>"; };
+		A00000000000000000000015 /* ColorCheckerReference.jpg */ = {isa = PBXFileReference; lastKnownFileType = image.jpeg; path = ColorCheckerReference.jpg; sourceTree = "<group>"; };
+		A00000000000000000000016 /* FocusPeaking.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = FocusPeaking.metal; sourceTree = "<group>"; };
 		A00000000000000000000010 /* InCamUITests/CameraWorkflowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InCamUITests/CameraWorkflowTests.swift; sourceTree = SOURCE_ROOT; };
 		A00000000000000000000011 /* InCamUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = InCamUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -59,6 +70,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B00000000000000000000016 /* MetalPetal in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -77,6 +89,11 @@
 		D00000000000000000000002 /* InCam */ = {
 			isa = PBXGroup;
 			children = (
+				A00000000000000000000012 /* AppFeatureAvailability.swift */,
+				A00000000000000000000013 /* CameraColorProfileDock.swift */,
+				A00000000000000000000014 /* ColorProfileDummy.png */,
+				A00000000000000000000015 /* ColorCheckerReference.jpg */,
+				A00000000000000000000016 /* FocusPeaking.metal */,
 				A0000000000000000000000F /* CameraOrientation.swift */,
 				A00000000000000000000001 /* InCamApp.swift */,
 				A00000000000000000000002 /* Theme.swift */,
@@ -120,6 +137,9 @@
 			dependencies = (
 			);
 			name = InCam;
+			packageProductDependencies = (
+				G00000000000000000000001 /* MetalPetal */,
+			);
 			productName = InCam;
 			productReference = A0000000000000000000000E /* InCam.app */;
 			productType = "com.apple.product-type.application";
@@ -167,6 +187,9 @@
 			productRefGroup = D00000000000000000000003 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
+			packageReferences = (
+				H00000000000000000000001 /* XCRemoteSwiftPackageReference "raster" */,
+			);
 			targets = (
 				E00000000000000000000001 /* InCam */,
 				E00000000000000000000003 /* InCamUITests */,
@@ -174,11 +197,32 @@
 		};
 /* End PBXProject section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		H00000000000000000000001 /* XCRemoteSwiftPackageReference "raster" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/aldealabs/raster.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.26.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		G00000000000000000000001 /* MetalPetal */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = H00000000000000000000001 /* XCRemoteSwiftPackageReference "raster" */;
+			productName = MetalPetal;
+		};
+/* End XCSwiftPackageProductDependency section */
+
 /* Begin PBXResourcesBuildPhase section */
 		C00000000000000000000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B00000000000000000000014 /* ColorProfileDummy.png in Resources */,
+				B00000000000000000000015 /* ColorCheckerReference.jpg in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -203,6 +247,9 @@
 				B0000000000000000000000B /* CameraScreen.swift in Sources */,
 				B0000000000000000000000C /* SettingsView.swift in Sources */,
 				B0000000000000000000000D /* CameraColorEditorView.swift in Sources */,
+				B00000000000000000000012 /* AppFeatureAvailability.swift in Sources */,
+				B00000000000000000000013 /* CameraColorProfileDock.swift in Sources */,
+				B00000000000000000000017 /* FocusPeaking.metal in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

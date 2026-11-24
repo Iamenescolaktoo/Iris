@@ -1,5 +1,8 @@
 import SwiftUI
 
+// FILE GUIDE: Shared visual tokens and reusable glass/gradient modifiers.
+// Keeping them here avoids repeating color and material work throughout views.
+
 enum InCamTheme {
     static let ivory = Color(red: 0.94, green: 0.92, blue: 0.86)
     static let graphite = Color(red: 0.055, green: 0.055, blue: 0.06)
